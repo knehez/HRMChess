@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HRM Chess - AI Chess Game</title>
+    
+    <!-- ChessBoard.js CSS (helyi fájl) -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/chessboard-1.0.0.min.css') }}">
+    
+    <!-- Custom CSS -->
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: #333;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(45deg, #2c3e50, #34495e);
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            margin: 0;
+            font-size: 2.5em;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        
+        .model-info {
+            margin: 10px 0;
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+        
+        .game-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+            padding: 20px;
+        }
+        
+        .board-container {
+            flex: 1;
+            min-width: 400px;
+            text-align: center;
+        }
+        
+        #chessboard {
+            margin: 0 auto 20px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        
+        .game-controls {
+            flex: 0 0 300px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 20px;
+        }
+        
+        .control-section {
+            margin-bottom: 25px;
+        }
+        
+        .control-section h3 {
+            margin: 0 0 15px 0;
+            color: #2c3e50;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 5px;
+        }
+        
+        .btn {
+            background: #3498db;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: all 0.3s ease;
+            margin: 5px;
+            width: 100%;
+        }
+        
+        .btn:hover {
+            background: #2980b9;
+            transform: translateY(-2px);
+        }
+        
+        .btn:disabled {
+            background: #95a5a6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .btn-success {
+            background: #27ae60;
+        }
+        
+        .btn-success:hover {
+            background: #219a52;
+        }
+        
+        .btn-warning {
+            background: #f39c12;
+        }
+        
+        .btn-warning:hover {
+            background: #e67e22;
+        }
+        
+        .color-selection {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .color-btn {
+            flex: 1;
+            padding: 10px;
+            text-align: center;
+        }
+        
+        .game-status {
+            background: white;
+            border: 2px solid #3498db;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 15px;
+        }
+        
+        .status-item {
+            display: flex;
+            justify-content: space-between;
+            margin: 5px 0;
+            padding: 5px 0;
+            border-bottom: 1px solid #ecf0f1;
+        }
+        
+        .status-item:last-child {
+            border-bottom: none;
+        }
+        
+        .model-thinking {
+            text-align: center;
+            padding: 10px;
+            background: #fff3cd;
+            border: 1px solid #ffeaa7;
+            border-radius: 5px;
+            margin: 10px 0;
+            display: none;
+        }
+        
+        .move-history {
+            max-height: 200px;
+            overflow-y: auto;
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            padding: 10px;
+        }
+        
+        .move-item {
+            padding: 5px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            justify-content: space-between;
+        }
+        
+        .move-item:last-child {
+            border-bottom: none;
+        }
+        
+        .player-move {
+            color: #2980b9;
+            font-weight: bold;
+        }
+        
+        .model-move {
+            color: #c0392b;
+            font-weight: bold;
+        }
+        
+        .game-over {
+            background: #d4edda;
+            border: 2px solid #27ae60;
+            color: #155724;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+            font-size: 1.2em;
+            font-weight: bold;
+            margin: 15px 0;
+        }
+        
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(52, 152, 219, 0.3);
+            border-radius: 50%;
+            border-top-color: #3498db;
+            animation: spin 1s ease-in-out infinite;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        .error-message {
+            background: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+            padding: 10px;
+            border-radius: 5px;
+            margin: 10px 0;
+        }
+        
+        @media (max-width: 768px) {
+            .game-container {
+                flex-direction: column;
+            }
+            
+            .board-container {
+                min-width: 300px;
+            }
+            
+            .game-controls {
+                flex: none;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 HRM Chess AI</h1>
+            <div class="model-info">
+                Playing against: <strong>{{ model_info }}</strong>
+            </div>
+        </div>
+        
+        <div class="game-container">
+            <div class="board-container">
+                <div id="chessboard" style="width: 400px;"></div>
+                
+                <div class="model-thinking" id="model-thinking">
+                    <div class="loading"></div>
+                    AI is thinking...
+                </div>
+                
+                <div id="game-over-message" class="game-over" style="display: none;">
+                    <div id="game-result"></div>
+                </div>
+            </div>
+            
+            <div class="game-controls">
+                <div class="control-section">
+                    <h3>🎮 Game Controls</h3>
+                    
+                    <div class="color-selection">
+                        <button id="play-white" class="btn color-btn">Play as White</button>
+                        <button id="play-black" class="btn color-btn">Play as Black</button>
+                    </div>
+                    
+                    <button id="new-game" class="btn btn-success">New Game</button>
+                    <button id="resign" class="btn btn-warning" disabled>Resign</button>
+                </div>
+                
+                <div class="control-section">
+                    <h3>� Position FEN</h3>
+                    <div class="fen-display">
+                        <textarea id="fen-code" readonly style="
+                            width: 100%; 
+                            height: 80px; 
+                            font-family: monospace; 
+                            font-size: 12px; 
+                            padding: 8px; 
+                            border: 1px solid #ddd; 
+                            border-radius: 4px; 
+                            background: #f9f9f9; 
+                            resize: none;
+                            word-break: break-all;">rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1</textarea>
+                        <small style="color: #666; font-size: 11px;">Current position in FEN notation</small>
+                    </div>
+                </div>
+                
+                <div class="control-section">
+                    <h3>🤖 AI Analysis</h3>
+                    <div class="game-status">
+                        <div class="status-item">
+                            <span>Position Value:</span>
+                            <span id="model-value">-</span>
+                        </div>
+                        <div class="status-item">
+                            <span>Confidence:</span>
+                            <span id="model-confidence">-</span>
+                        </div>
+                        <div class="status-item">
+                            <span>Last Move:</span>
+                            <span id="model-last-move">-</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="control-section">
+                    <h3>📝 Move History</h3>
+                    <div class="move-history" id="move-history">
+                        <div style="text-align: center; color: #666;">
+                            Start a new game to see moves
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="control-section">
+                    <h3>♟️ Puzzle Solver</h3>
+                    <textarea id="fen-input" placeholder="Paste FEN here..." style="width:100%;height:50px;font-family:monospace;font-size:13px;padding:6px;border:1px solid #bbb;border-radius:4px;"></textarea>
+                    <button id="solve-fen-btn" class="btn btn-success" style="margin-top:8px;">Solve FEN</button>
+                    <div id="fen-solve-result" style="margin-top:10px;font-size:1em;"></div>
+                </div>
+                
+                <div id="error-container"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- jQuery (helyi fájl vagy CDN) -->
+    <script src="https://code.jquery.com/jquery-3.5.1.min.js"
+            integrity="sha384-ZvpUoO/+PpLXR1lu4jmpXWu80pZlYUAfxl5NsBMWOEPSjUn/6Z/hRTt8+pR6L4N2"
+            crossorigin="anonymous"></script>
+    
+    <!-- ChessBoard.js (helyi fájl) -->
+    <script src="{{ url_for('static', filename='js/chessboard-1.0.0.min.js') }}"></script>
+    
+    <!-- Chess.js for move validation -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.12.1/chess.min.js"></script>
+
+    <script>
+        let board = null;
+        let game = new Chess();
+        let currentGameId = null;
+        let playerColor = 'white';
+        let gameActive = false;
+        let moveHistory = [];
+        
+        // Initialize the board
+        function initBoard() {
+            // Check if ChessBoard is available (note: it's available as global Chessboard)
+            if (typeof Chessboard === 'undefined') {
+                console.error('ChessBoard library not loaded!');
+                showError('ChessBoard library failed to load. Please refresh the page.');
+                return;
+            }
+            
+            const config = {
+                draggable: true,
+                position: 'start',
+                onDragStart: onDragStart,
+                onDrop: onDrop,
+                onSnapEnd: onSnapEnd,
+                // Use a function to generate piece image paths
+                pieceTheme: function(piece) {
+                    return "{{ url_for('static', filename='img/chesspieces/wikipedia/') }}" + piece + ".png";
+                }
+            };
+            
+            // Use the official Chessboard constructor (global variable)
+            board = Chessboard('chessboard', config);
+            console.log('Chessboard initialized successfully');
+        }
+        
+        function onDragStart(source, piece, position, orientation) {
+            // Don't pick up pieces if the game is over
+            if (game.game_over()) return false;
+            
+            // Don't pick up pieces if it's not the player's turn
+            if (!gameActive) return false;
+            
+            // Only pick up pieces for the side to move and player's color
+            if ((game.turn() === 'w' && piece.search(/^b/) !== -1) ||
+                (game.turn() === 'b' && piece.search(/^w/) !== -1)) {
+                return false;
+            }
+            
+            // Don't pick up pieces if it's not the player's turn
+            if ((playerColor === 'white' && game.turn() === 'b') ||
+                (playerColor === 'black' && game.turn() === 'w')) {
+                return false;
+            }
+        }
+        
+        function onDrop(source, target) {
+            // See if the move is legal
+            const move = game.move({
+                from: source,
+                to: target,
+                promotion: 'q' // Always promote to queen for simplicity
+            });
+            
+            // Illegal move
+            if (move === null) return 'snapback';
+            
+            // Update FEN immediately after player move
+            updateGameStatus();
+            
+            // Make the move on the server
+            makePlayerMove(move.san, source + target);
+        }
+        
+        function onSnapEnd() {
+            board.position(game.fen());
+        }
+        
+        function makePlayerMove(sanMove, uciMove) {
+            if (!currentGameId) return;
+            
+            showModelThinking(true);
+            
+            fetch('/make_move', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    game_id: currentGameId,
+                    move: uciMove
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                showModelThinking(false);
+                
+                if (data.error) {
+                    showError(data.error);
+                    game.undo(); // Undo the move
+                    board.position(game.fen());
+                    return;
+                }
+                
+                // Update game state
+                game.load(data.board);
+                board.position(data.board);
+                
+                // Add player move to history
+                addMoveToHistory(sanMove, 'player');
+                
+                // Update AI analysis
+                if (data.model_value !== undefined) {
+                    updateModelAnalysis(data.model_value, data.model_confidence, data.model_move);
+                }
+                
+                // Add model move to history
+                if (data.model_move) {
+                    const modelSan = game.move(data.model_move).san;
+                    game.undo();
+                    addMoveToHistory(modelSan, 'model');
+                    
+                    // Apply model move
+                    game.move(data.model_move);
+                    board.position(game.fen());
+                }
+                
+                updateGameStatus();
+                
+                // Check if game is over
+                if (data.game_over) {
+                    endGame(data.result, data.winner);
+                }
+            })
+            .catch(error => {
+                showModelThinking(false);
+                showError('Network error: ' + error.message);
+                game.undo(); // Undo the move
+                board.position(game.fen());
+            });
+        }
+        
+        function startNewGame(color) {
+            playerColor = color;
+            
+            fetch('/new_game', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    color: color
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                currentGameId = data.game_id;
+                game.reset();
+                
+                if (data.board) {
+                    game.load(data.board);
+                }
+                
+                board.position(data.board || 'start');
+                board.orientation(color);
+                
+                gameActive = true;
+                moveHistory = [];
+                
+                // Clear previous game data
+                document.getElementById('move-history').innerHTML = '';
+                document.getElementById('game-over-message').style.display = 'none';
+                clearError();
+                
+                // If model made first move (player is black)
+                if (data.model_move) {
+                    const modelSan = game.move(data.model_move).san;
+                    game.undo();
+                    addMoveToHistory(modelSan, 'model');
+                    game.move(data.model_move);
+                    board.position(game.fen());
+                    
+                    updateModelAnalysis(data.model_value, data.model_confidence, data.model_move);
+                }
+                
+                updateGameStatus();
+                
+                // Enable/disable buttons
+                document.getElementById('resign').disabled = false;
+                document.getElementById('new-game').textContent = 'New Game';
+            })
+            .catch(error => {
+                showError('Failed to start new game: ' + error.message);
+            });
+        }
+        
+        function updateGameStatus() {
+            // Update FEN display instead of old game status
+            document.getElementById('fen-code').value = game.fen();
+        }
+        
+        function updateModelAnalysis(value, confidence, lastMove) {
+            document.getElementById('model-value').textContent = value ? value.toFixed(3) : '-';
+            document.getElementById('model-confidence').textContent = confidence ? (confidence * 100).toFixed(1) + '%' : '-';
+            document.getElementById('model-last-move').textContent = lastMove || '-';
+        }
+        
+        function addMoveToHistory(move, player) {
+            const historyDiv = document.getElementById('move-history');
+            const moveDiv = document.createElement('div');
+            moveDiv.className = 'move-item';
+            
+            const moveNumber = Math.ceil(moveHistory.length / 2) + 1;
+            const isWhite = moveHistory.length % 2 === 0;
+            
+            moveDiv.innerHTML = `
+                <span class="${player === 'model' ? 'model-move' : 'player-move'}">
+                    ${isWhite ? moveNumber + '.' : ''} ${move}
+                </span>
+                <span style="font-size: 0.8em; color: #666;">
+                    ${player === 'model' ? '🤖' : '👤'}
+                </span>
+            `;
+            
+            historyDiv.appendChild(moveDiv);
+            historyDiv.scrollTop = historyDiv.scrollHeight;
+            
+            moveHistory.push({move, player});
+        }
+        
+        function endGame(result, winner) {
+            gameActive = false;
+            
+            let message = `Game Over: ${result}`;
+            if (winner === 'Player') {
+                message = `🎉 Congratulations! You won! (${result})`;
+            } else if (winner === 'Model') {
+                message = `🤖 AI wins this time! (${result})`;
+            } else {
+                message = `🤝 It's a draw! (${result})`;
+            }
+            
+            document.getElementById('game-result').textContent = message;
+            document.getElementById('game-over-message').style.display = 'block';
+            document.getElementById('resign').disabled = true;
+        }
+        
+        function showModelThinking(show) {
+            document.getElementById('model-thinking').style.display = show ? 'block' : 'none';
+        }
+        
+        function showError(message) {
+            const errorContainer = document.getElementById('error-container');
+            errorContainer.innerHTML = `<div class="error-message">${message}</div>`;
+        }
+        
+        function clearError() {
+            document.getElementById('error-container').innerHTML = '';
+        }
+        
+        function resignGame() {
+            if (currentGameId && gameActive) {
+                endGame('0-1', playerColor === 'white' ? 'Model' : 'Player');
+            }
+        }
+        
+        // Event listeners
+        document.getElementById('play-white').addEventListener('click', () => startNewGame('white'));
+        document.getElementById('play-black').addEventListener('click', () => startNewGame('black'));
+        document.getElementById('new-game').addEventListener('click', () => {
+            if (gameActive) {
+                if (confirm('Are you sure you want to start a new game?')) {
+                    startNewGame(playerColor);
+                }
+            } else {
+                startNewGame(playerColor || 'white');
+            }
+        });
+        document.getElementById('resign').addEventListener('click', resignGame);
+        
+        // --- FEN Puzzle Solver ---
+        document.getElementById('solve-fen-btn').addEventListener('click', function() {
+            const fen = document.getElementById('fen-input').value.trim();
+            if (!fen) {
+                showError('Please enter a FEN string!');
+                return;
+            }
+            document.getElementById('fen-solve-result').innerHTML = '<span class="loading"></span> Solving...';
+            fetch('/solve_fen', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ fen })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.error) {
+                    document.getElementById('fen-solve-result').innerHTML = `<span style='color:#c0392b;'>${data.error}</span>`;
+                } else {
+                    // Állítsuk be a táblát a beküldött FEN-re (de NE léptessük le a megoldást)
+                    game.load(fen);
+                    board.position(fen);
+                    document.getElementById('fen-solve-result').innerHTML =
+                        `<b>Best move:</b> <span style='color:#2980b9;'>${data.best_move}</span><br>` +
+                        `<b>Value:</b> <span style='color:#27ae60;'>${data.value.toFixed(3)}</span><br>` +
+                        `<b>Confidence:</b> <span style='color:#8e44ad;'>${(data.confidence*100).toFixed(1)}%</span>`;
+                }
+            })
+            .catch(err => {
+                document.getElementById('fen-solve-result').innerHTML = `<span style='color:#c0392b;'>Error: ${err.message}</span>`;
+            });
+        });
+        
+        // Initialize the board when page loads
+        $(document).ready(function() {
+            console.log('Page loaded, available objects:', {
+                'Chessboard': typeof Chessboard,
+                'Chess': typeof Chess,
+                'jQuery': typeof $
+            });
+            
+            initBoard();
+            updateGameStatus();
+        });
+    </script>
+</body>
+</html>
