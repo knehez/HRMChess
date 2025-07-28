@@ -714,12 +714,11 @@ def get_manual_parameters():
 class StockfishEvaluator:
     """Stockfish motor integráció pozíció értékeléshez - PERZISZTENS KAPCSOLAT"""
     
-    def __init__(self, stockfish_path="./stockfish.exe", depth=8):
+    def __init__(self, stockfish_path="./stockfish.exe", movetime=50):
         self.stockfish_path = stockfish_path
-        self.depth = depth
+        self.movetime = movetime
         self.process = None
         self.initialized = False
-        self._debug_counter = 0
         self._init_engine()
     
     def _init_engine(self):
@@ -811,7 +810,7 @@ class StockfishEvaluator:
     
     def evaluate_position(self, fen):
         """
-        Pozíció értékelése Stockfish-sel - GYORS PERZISZTENS MÓDSZER (Windows optimalizált)
+        Pozíció értékelése Stockfish-sel
         Returns: (best_move_uci, evaluation_score)
         """
         if not self.initialized or not self.process:
@@ -821,8 +820,8 @@ class StockfishEvaluator:
             # Set position
             self._send_command(f"position fen {fen}")
             
-            # Get evaluation with limited depth for speed
-            self._send_command(f"go depth {self.depth}")
+            # Get evaluation with limited thinking time
+            self._send_command(f"go movetime {self.movetime}")
             
             # Parse response - simplified approach for Windows
             best_move = None
@@ -870,17 +869,10 @@ class StockfishEvaluator:
                 except Exception as e:
                     break
             
-            # Debug info only once
-            if self._debug_counter == 0:
-                print(f"🔍 Persistent Stockfish working: move={best_move}, score={score:.3f}")
-                self._debug_counter = 1
-            
             return best_move, score
             
         except Exception as e:
-            if self._debug_counter < 3:  # Only show first few errors
-                print(f"⚠️ Stockfish evaluation error: {e}")
-                self._debug_counter += 1
+            print(f"⚠️ Stockfish evaluation error: {e}")
             return None, 0.0
     
     def close(self):
