@@ -7,7 +7,7 @@ import chess
 import chess.engine
 import numpy as np
 import time
-from Chess import fen_to_tensor
+from Chess import fen_to_bitboard_tensor
 from hrm_model import HRMChess
 from collections import defaultdict
 import json
@@ -34,14 +34,14 @@ class ELORatingSystem:
             hidden_dim, N, T = self._detect_conv_parameters(checkpoint)
             
             # Create convolutional HRM model
-            self.model = HRMChess(input_dim=72, hidden_dim=hidden_dim, N=N, T=T).to(self.device)
+            self.model = HRMChess(input_dim=20, hidden_dim=hidden_dim, N=N, T=T).to(self.device)
             self.model_type = f"Convolutional-HRM-{hidden_dim}-N{N}-T{T}"
             print(f"🏗️ Created convolutional HRM model: hidden_dim={hidden_dim}, N={N}, T={T}")
                 
         except Exception as e:
             print(f"⚠️ Error detecting model parameters: {e}")
             print("🔧 Creating default convolutional HRM model...")
-            self.model = HRMChess(input_dim=72, hidden_dim=128, N=8, T=8).to(self.device)
+            self.model = HRMChess(input_dim=20, hidden_dim=128, N=8, T=8).to(self.device)
             self.model_type = "Default-Convolutional-HRM-128"
         
         # Load model weights
@@ -204,44 +204,42 @@ class ELORatingSystem:
         print(f"⚠️ N and T not saved in model, using defaults: N={N}, T={T}")
         return hidden_dim, N, T
         
-    def model_move(self, board, temperature=0.7, top_k=5, debug=False):
+    def model_move(self, board, temperature=0.7, debug=False):
         """Továbbfejlesztett modell lépés választás erősebb játékért"""
-        state = fen_to_tensor(board.fen())
-        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
-        
+        state = fen_to_bitboard_tensor(board.fen())
+        # Bitműveletekhez int típus kell!
+        state_tensor = torch.tensor(state, dtype=torch.long).unsqueeze(0).to(self.device)
+
         with torch.no_grad():
             # HRM move prediction - Policy-only model
             move_logits = self.model(state_tensor)
-            
-            # No value output from current HRM model
-            position_value = None
-            
+
             policy_probs = torch.softmax(move_logits.view(-1) / temperature, dim=0)  # Temperature scaling
-        
+
         # Csak legális lépések
         legal_moves = list(board.legal_moves)
         legal_probs = []
         move_info = []
-        
+
         for move in legal_moves:
             idx = move.from_square * 64 + move.to_square
             prob = policy_probs[idx].item()
             legal_probs.append(prob)
             move_info.append((move, prob))
-        
+
         if debug:
             # Debug: show top 3 moves
             move_info.sort(key=lambda x: x[1], reverse=True)
             print(f"  Top moves: {move_info[:3]}")
-        
+
         # Erősebb lépés választás - top-k sampling helyett best move
         legal_probs = np.array(legal_probs)
-        
+
         selected_idx = np.argmax(legal_probs)
-        
+
         selected_move = legal_moves[selected_idx]
         move_confidence = legal_probs[selected_idx]
-        
+
         return selected_move, move_confidence
     
     def play_vs_stockfish(self, stockfish_path, depth=1, time_limit=0.05):
@@ -259,7 +257,7 @@ class ELORatingSystem:
                     if (board.turn == chess.WHITE) == model_is_white:
                         # Model lépése - agresszívebb beállítás
                         try:
-                            move, confidence = self.model_move(board, temperature=0.6, top_k=3, debug=False)
+                            move, confidence = self.model_move(board, temperature=0.6, debug=False)
                             board.push(move)
                             moves_played.append(f"Model: {move}")
                             game_log.append(f"Move {len(moves_played)}: Model plays {move} (conf: {confidence:.3f})")
@@ -339,7 +337,7 @@ class ELORatingSystem:
             while not board.is_game_over() and moves_played < max_moves:
                 if (board.turn == chess.WHITE) == model_is_white:
                     # Model lépése - agresszívebb beállítással
-                    move, confidence = self.model_move(board, temperature=0.8, top_k=3)
+                    move, confidence = self.model_move(board, temperature=0.8)
                     board.push(move)
                 else:
                     # Random lépés - de nem teljesen véletlen

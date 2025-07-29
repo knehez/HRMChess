@@ -18,38 +18,14 @@ class PolicyDataset(torch.utils.data.Dataset):
             states: Board states (tensors)
             policies: List of move evaluations from Stockfish [(move_tuple, score), ...]
         """
-        self.states = torch.FloatTensor(states)
+        self.states = torch.from_numpy(states).long()
         
-        # Convert Stockfish evaluations to probability distributions
+        # Each policy is now a single (from_sq, to_sq) tuple per position
         policy_matrices = []
-        for moves in policies:
+        for move in policies:
             policy_matrix = torch.zeros(64, 64)
-            
-            if len(moves) > 0:
-                # Extract scores and convert to probabilities
-                move_tuples = []
-                scores = []
-                
-                for move_tuple, score in moves:
-                    move_tuples.append(move_tuple)
-                    scores.append(score)                
-                # Convert scores to probabilities using softmax with temperature
-                if len(scores) > 0:
-                    scores_tensor = torch.tensor(scores, dtype=torch.float32)
-                    # Use temperature to control sharpness (lower = more focused)
-                    temperature = 0.2
-                    probabilities = torch.softmax(scores_tensor / temperature, dim=0)
-                    
-                    # Assign probabilities to policy matrix
-                    for (from_sq, to_sq), prob in zip(move_tuples, probabilities):
-                        if 0 <= from_sq < 64 and 0 <= to_sq < 64:
-                            policy_matrix[from_sq, to_sq] = prob.item()
-            
-            # If no moves or all zero, create uniform distribution over legal moves
-            if policy_matrix.sum() == 0:
-                # This shouldn't happen with proper Stockfish data, but safety fallback
-                policy_matrix.fill_(1.0 / (64 * 64))
-            
+            from_sq, to_sq = move
+            policy_matrix[from_sq, to_sq] = 1.0
             policy_matrices.append(policy_matrix)
         
         self.policies = torch.stack(policy_matrices)
@@ -62,38 +38,23 @@ class PolicyDataset(torch.utils.data.Dataset):
 
 
 class HRMChess(nn.Module):
-    def __init__(self, input_dim=72, hidden_dim=192, N=8, T=8):  # Konvolúciós HRM
+    def __init__(self, input_dim=20, hidden_dim=192, N=8, T=8):  # Bitboard HRM
         super().__init__()
         self.N = N
         self.T = T
         self.hidden_dim = hidden_dim
         
-        # 2D Convolutional input processor - egyszerűsített 8x8 sakktáblához
-        # Input: 64 mező (8x8) + 8 extra info
-        self.board_conv = nn.Sequential(
-            # Egyszerű konvolúció 8x8 sakktáblához
-            nn.Conv2d(1, hidden_dim, kernel_size=3, padding=1),  # 8x8 → 8x8
-            nn.BatchNorm2d(hidden_dim),
+        # Bitboard input processor
+        self.bitboard_processor = nn.Sequential(
+            nn.Conv2d(input_dim, hidden_dim, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Flatten(),  # 8x8 → 64 * hidden_dim
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
         )
-        
-        # Extra info processor (8 dimenziós meta adatok)
-        self.extra_processor = nn.Sequential(
-            nn.Linear(8, hidden_dim//4),
-            nn.ReLU(),
-            nn.Linear(hidden_dim//4, hidden_dim//4)
-        )
-        
-        # Combined features processor - frissített dimenzióval
-        self.feature_combiner = nn.Sequential(
-            nn.Linear(64 * hidden_dim + hidden_dim//4, hidden_dim),  # Egyszerűsített board_conv + extra
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        )
+
+        # Adjust the input dimension of the board_enhancer
+        self.feature_combiner = nn.Linear(hidden_dim * 8 * 8, hidden_dim)
         
         # Board representation enhancer - további reprezentációs rétegek
         self.board_enhancer = nn.Sequential(
@@ -130,13 +91,13 @@ class HRMChess(nn.Module):
     
     def forward(self, x, z_init=None):
         """
-        A konvolúciós HRM modell forward pass-a.
-        - Bemenet: 72 dimenziós vektor (64 mező + 8 extra info).
-        - A 64 mezőt 2D konvolúcióval dolgozza fel.
+        A bitboard-alapú HRM modell forward pass-a.
+        - Bemenet: 20-elemű uint64 vektor.
+        - A bemenetet 20x64-es bináris mátrixxá alakítja.
         - A kimenet egy policy mátrix (64x64), ami a lépés-valószínűségeket tartalmazza.
         
         Args:
-            x: Bemeneti tenzor (batch, 72).
+            x: Bemeneti tenzor (batch, 20).
             z_init: Kezdeti HRM állapotok (opcionális).
             
         Returns:
@@ -144,23 +105,15 @@ class HRMChess(nn.Module):
         """
         batch_size = x.size(0)
         device = x.device
+
+        # Convert uint64 vector to a 20x64 binary tensor
+        unpacked = torch.zeros(batch_size, 20, 64, device=device, dtype=torch.float32)
+        for i in range(64):
+            unpacked[:, :, i] = ((x >> i) & 1).float()
         
-        # Split input: 64 board squares + 8 extra info
-        board_squares = x[:, :64]  # (batch, 64) - sakktábla mezők
-        extra_info = x[:, 64:]     # (batch, 8) - meta információk
-        
-        # Reshape board to 2D for convolution: (batch, 64) → (batch, 1, 8, 8)
-        board_2d = board_squares.view(batch_size, 1, 8, 8)
-        
-        # Process board with simplified 2D convolution
-        board_features = self.board_conv(board_2d)  # (batch, 64 * hidden_dim)
-        
-        # Process extra info
-        extra_features = self.extra_processor(extra_info)  # (batch, hidden_dim//4)
-        
-        # Combine board and extra features
-        combined_features = torch.cat([board_features, extra_features], dim=-1)
-        board_features = self.feature_combiner(combined_features)  # (batch, hidden_dim)
+        # Process bitboards
+        board_features = self.bitboard_processor(unpacked.view(batch_size, 20, 8, 8))
+        board_features = self.feature_combiner(board_features)
         
         # Board representation enhancer
         board_features = self.board_enhancer(board_features)  # További feldolgozás

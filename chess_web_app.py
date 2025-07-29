@@ -15,7 +15,7 @@ import uuid
 import glob
 
 # Import our trained model
-from Chess import fen_to_tensor
+from Chess import fen_to_bitboard_tensor
 from hrm_model import HRMChess
 
 app = Flask(__name__)
@@ -248,7 +248,7 @@ class ChessGameManager:
         """Get the best move from the HRM model"""
         try:
             # Convert board to tensor using simplified representation
-            state = fen_to_tensor(board.fen())
+            state = fen_to_bitboard_tensor(board.fen())
             state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
             
             with torch.no_grad():

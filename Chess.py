@@ -176,7 +176,7 @@ def detect_gpu_memory_and_optimize_training():
         print(" Cannot proceed without GPU information.")
         exit(1)
 
-def load_pgn_data(pgn_path, fen_to_tensor, max_games=None, max_moves=40, min_elo=1600):
+def load_pgn_data(pgn_path, fen_to_bitboard_tensor, max_positions=None, max_moves=40, min_elo=1600):
     all_states, all_policies, all_fens = [], [], []
     
     # Debug counters
@@ -204,8 +204,8 @@ def load_pgn_data(pgn_path, fen_to_tensor, max_games=None, max_moves=40, min_elo
             if stats['total_games'] % 1000 == 0:
                 print(f"PGN: {stats['total_games']} ellenőrizve, {stats['processed_games']} feldolgozva, "
                       f"{stats['positions_extracted']} pozíció")
-                      
-            if max_games is not None and stats['processed_games'] >= max_games:
+            
+            if max_positions < stats['positions_extracted']:
                 break
             
             # Szűrés: csak megfelelő játékosok játszmai
@@ -286,7 +286,7 @@ def load_pgn_data(pgn_path, fen_to_tensor, max_games=None, max_moves=40, min_elo
                             stats['pawn_moves'] += 1
                     
                     if include_move:
-                        state = fen_to_tensor(board.fen())
+                        state = fen_to_bitboard_tensor(board.fen())
                         policy_sparse = (move.from_square, move.to_square)
                         current_fen = board.fen()  # Store the actual FEN
                         
@@ -323,7 +323,7 @@ def load_pgn_data(pgn_path, fen_to_tensor, max_games=None, max_moves=40, min_elo
     print(f"✅ BALANCED PGN adatok: {len(all_states):,} pozíció {stats['processed_games']} játszmából")
     return all_states, all_policies, all_fens
 
-def load_puzzle_data(csv_path, fen_to_tensor, max_puzzles=None, min_rating=800, max_rating=2200):
+def load_puzzle_data(csv_path, fen_to_bitboard_tensor, max_puzzles=None, min_rating=800, max_rating=2200):
     """
     Lichess puzzle CSV betöltése taktikai training adatokhoz
     
@@ -411,7 +411,7 @@ def load_puzzle_data(csv_path, fen_to_tensor, max_puzzles=None, min_rating=800, 
                         continue
                     
                     # Convert position to tensor
-                    state = fen_to_tensor(fen)
+                    state = fen_to_bitboard_tensor(fen)
                     policy = (move.from_square, move.to_square)
                     
                     puzzle_states.append(state)
@@ -451,42 +451,63 @@ def load_puzzle_data(csv_path, fen_to_tensor, max_puzzles=None, min_rating=800, 
     print(f"✅ TACTICAL PUZZLES: {len(puzzle_states):,} pozíció betöltve")
     return puzzle_states, puzzle_policies, puzzle_fens
 
-# Egyszerűsített board encoder - compact reprezentáció
-def fen_to_tensor(fen):
+def fen_to_bitboard_tensor(fen):
+    """
+    Converts a FEN string to a compact 20-element uint64 vector representation.
+    
+    Vector elements:
+    - 0-11: Bitboards for pieces (P, N, B, R, Q, K, p, n, b, r, q, k)
+    - 12: Turn (all 1s for white, 0 for black)
+    - 13: White kingside castling rights (all 1s if available)
+    - 14: White queenside castling rights (all 1s if available)
+    - 15: Black kingside castling rights (all 1s if available)
+    - 16: Black queenside castling rights (all 1s if available)
+    - 17: En passant square bitboard
+    - 18: Halfmove clock (integer value)
+    - 19: Fullmove number (integer value)
+    """
     board = chess.Board(fen)
     
-    # Compact piece encoding: 4 bit elég lenne, de használunk 8-bit integers
-    piece_map = {
-        'P': 1, 'N': 2, 'B': 3, 'R': 4, 'Q': 5, 'K': 6,
-        'p': 7, 'n': 8, 'b': 9, 'r': 10, 'q': 11, 'k': 12
+    # Initialize a 20-element uint64 vector
+    vector = np.zeros(20, dtype=np.uint64)
+    
+    # Piece bitboards
+    piece_to_plane = {
+        'P': 0, 'N': 1, 'B': 2, 'R': 3, 'Q': 4, 'K': 5,
+        'p': 6, 'n': 7, 'b': 8, 'r': 9, 'q': 10, 'k': 11
     }
     
-    # 64 mező mint uint8 + extra információk mint float16
-    board_state = np.zeros(64 + 8, dtype=np.uint8)  # Ultra compact representation
+    for piece_symbol, plane_index in piece_to_plane.items():
+        piece_type = chess.PIECE_SYMBOLS.index(piece_symbol.lower())
+        color = chess.WHITE if piece_symbol.isupper() else chess.BLACK
+        vector[plane_index] = board.pieces_mask(piece_type, color)
+            
+    # Turn
+    if board.turn == chess.WHITE:
+        vector[12] = np.uint64(0xFFFFFFFFFFFFFFFF)
+    else:
+        vector[12] = np.uint64(0)
+        
+    # Castling rights
+    if board.has_kingside_castling_rights(chess.WHITE):
+        vector[13] = np.uint64(0xFFFFFFFFFFFFFFFF)
+    if board.has_queenside_castling_rights(chess.WHITE):
+        vector[14] = np.uint64(0xFFFFFFFFFFFFFFFF)
+    if board.has_kingside_castling_rights(chess.BLACK):
+        vector[15] = np.uint64(0xFFFFFFFFFFFFFFFF)
+    if board.has_queenside_castling_rights(chess.BLACK):
+        vector[16] = np.uint64(0xFFFFFFFFFFFFFFFF)
+        
+    # En passant square
+    if board.ep_square:
+        vector[17] = np.uint64(1) << board.ep_square
+        
+    # Halfmove and fullmove clocks
+    vector[18] = np.uint64(board.halfmove_clock)
+    vector[19] = np.uint64(board.fullmove_number)
     
-    # Bábuk pozíciói (64 dimenzió mint integer)
-    for square in chess.SQUARES:
-        piece = board.piece_at(square)
-        if piece:
-            board_state[square] = piece_map[piece.symbol()]
-    
-    # Extra információk (8 dimenzió) - ezek maradnak float típusúak
-    extra_info = np.zeros(8, dtype=np.float16)
-    extra_info[0] = float(board.turn)  # Ki van soron (0=fekete, 1=fehér)
-    extra_info[1] = float(board.has_kingside_castling_rights(chess.WHITE))
-    extra_info[2] = float(board.has_queenside_castling_rights(chess.WHITE))
-    extra_info[3] = float(board.has_kingside_castling_rights(chess.BLACK))
-    extra_info[4] = float(board.has_queenside_castling_rights(chess.BLACK))
-    extra_info[5] = float(board.ep_square) if board.ep_square is not None else -1.0
-    extra_info[6] = float(board.halfmove_clock) / 100.0
-    extra_info[7] = float(board.fullmove_number) / 100.0
-    
-    # Combine board and extra info - convert to float32 for neural network
-    result = np.zeros(72, dtype=np.float32)
-    result[:64] = board_state[:64].astype(np.float32)  # Convert pieces to float
-    result[64:] = extra_info.astype(np.float32)  # Convert extra info to float
-    
-    return result
+    return vector
+
 
 def get_manual_parameters():
     """Get manual hyperparameters from user"""
@@ -502,7 +523,7 @@ def get_manual_parameters():
     # Get hidden_dim
     while True:
         try:
-            hidden_dim = int(input("\nEnter hidden_dim (128-512, recommended 192-256): "))
+            hidden_dim = int(input("\nEnter hidden_dim (64-512): "))
             if 64 <= hidden_dim <= 1024:
                 break
             else:
@@ -513,7 +534,7 @@ def get_manual_parameters():
     # Get N
     while True:
         try:
-            N = int(input("Enter N - reasoning cycles (2-12, recommended 2-12): "))
+            N = int(input("Enter N - reasoning cycles (2-12): "))
             if 2 <= N <= 12:
                 break
             else:
@@ -524,7 +545,7 @@ def get_manual_parameters():
     # Get T
     while True:
         try:
-            T = int(input("Enter T - steps per cycle (2-12, recommended 3-12): "))
+            T = int(input("Enter T - steps per cycle (2-12): "))
             if 2 <= T <= 12:
                 break
             else:
@@ -561,388 +582,9 @@ def get_manual_parameters():
     return hidden_dim, N, T
 
 
-class StockfishEvaluator:
-    """Stockfish motor integráció pozíció értékeléshez - EGYSZERŰ READLINE MEGKÖZELÍTÉS"""
-    
-    def __init__(self, stockfish_path="./stockfish.exe", movetime=50):
-        self.stockfish_path = stockfish_path
-        self.movetime = movetime
-        self.process = None
-        self.initialized = False
-        self._init_engine()
-    
-    def _init_engine(self):
-        """Stockfish motor inicializálás - egyszerű megközelítés"""
-        try:
-            if os.path.exists(self.stockfish_path):
-                print(f"🤖 Stockfish found: {self.stockfish_path}")
-            else:
-                print(f"❌ Stockfish not found at: {self.stockfish_path}")
-                print("🔍 Looking for stockfish in system PATH...")
-                # Try system stockfish
-                self.stockfish_path = "stockfish"
-            
-            # Start Stockfish process with simple configuration
-            print("🚀 Starting Stockfish engine...")
-            self.process = subprocess.Popen(
-                [self.stockfish_path],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                universal_newlines=True
-            )
-            
-            # Simple UCI initialization
-            self._send_command("uci")
-            self._wait_for_response("uciok")
-            
-            self._send_command("isready")
-            self._wait_for_response("readyok")
-            
-            print("✅ Stockfish engine ready!")
-            self.initialized = True
-            
-        except Exception as e:
-            print(f"⚠️ Stockfish initialization error: {e}")
-            self.initialized = False
-    
-    def _send_command(self, command):
-        """Send command to Stockfish - egyszerű megközelítés"""
-        if self.process and self.process.stdin:
-            try:
-                self.process.stdin.write(command + "\n")
-                self.process.stdin.flush()
-            except Exception as e:
-                print(f"⚠️ Error sending command: {e}")
-                self.initialized = False
-    
-    def _read_line(self, timeout=3.0):
-        """Read a line from Stockfish - EGYSZERŰ READLINE"""
-        if not self.process or not self.process.stdout:
-            return None
-        
-        try:
-            # Simple readline with basic timeout using threading
-            import threading
-            import queue
-            
-            result_queue = queue.Queue()
-            
-            def read_line():
-                try:
-                    line = self.process.stdout.readline()
-                    result_queue.put(line)
-                except Exception as e:
-                    result_queue.put(None)
-            
-            # Start reading thread
-            thread = threading.Thread(target=read_line)
-            thread.daemon = True
-            thread.start()
-            
-            # Wait for result with timeout
-            thread.join(timeout=timeout)
-            
-            if not result_queue.empty():
-                line = result_queue.get_nowait()
-                if line:
-                    return line.strip()
-            
-            return None
-            
-        except Exception as e:
-            return None
-    
-    def _wait_for_response(self, expected, timeout=5.0):
-        """Wait for specific response from Stockfish - egyszerű megközelítés"""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            line = self._read_line(1.0)  # 1 second timeout per line
-            if line and expected in line:
-                return True
-            if not line:  # If no line received, continue waiting
-                continue
-        return False
 
-    def get_top_k_moves(self, fen, k=3):
-        """
-        Visszaadja a legjobb k lépést a Stockfish 'MultiPV' funkciójával.
-        Returns: List of (move_uci, score_cp) tuples.
-        """
-        if not self.initialized or not self.process:
-            print("⚠️ Stockfish engine not initialized")
-            return []
-
-        try:
-            # Set MultiPV to get top k moves
-            self._send_command("ucinewgame")
-            self._send_command(f"setoption name MultiPV value {k}")
-            
-            # Set position
-            self._send_command(f"position fen {fen}")
-            self._send_command(f"go movetime {self.movetime}")
-
-            top_moves = {}
-            start_time = time.time()
-            
-            # Read lines until 'bestmove' is found or timeout
-            while time.time() - start_time < (self.movetime / 1000) + 2: # movetime in ms + buffer
-                line = self._read_line(timeout=1.0)
-                if not line:
-                    continue
-
-                if line.startswith('bestmove'):
-                    break
-
-                if 'multipv' in line and 'score cp' in line:
-                    parts = line.split()
-                    try:
-                        pv_index = parts.index('multipv') + 1
-                        move_index = parts.index('pv') + 1
-                        score_index = parts.index('cp') + 1
-                        
-                        rank = int(parts[pv_index])
-                        move_uci = parts[move_index]
-                        score_cp = int(parts[score_index])
-                        
-                        # Store the move if it's within the top k
-                        if rank <= k:
-                            top_moves[rank] = (move_uci, score_cp)
-
-                    except (ValueError, IndexError):
-                        continue
-            
-            # Reset MultiPV to 1 for other functions
-            self._send_command("setoption name MultiPV value 1")
-
-            # Return sorted list of moves
-            return [top_moves[i] for i in sorted(top_moves.keys())]
-
-        except Exception as e:
-            print(f"⚠️ Error getting top k moves: {e}")
-            # Ensure MultiPV is reset on error
-            self._send_command("setoption name MultiPV value 1")
-            return []
-    
-    def close(self):
-        """Close Stockfish engine - egyszerű cleanup"""
-        if self.process:
-            try:
-                self._send_command("quit")
-                self.process.terminate()
-                self.process.wait(timeout=3)
-            except:
-                if self.process:
-                    self.process.kill()
-            finally:
-                self.process = None
-                self.initialized = False
-                print("🔌 Stockfish engine closed")
-    
-    def __del__(self):
-        """Cleanup when object is destroyed"""
-        self.close()
-
-
-class ParallelStockfishEvaluator:
-    """Parallel Stockfish evaluator using 2 fixed processes for faster evaluation"""
-    
-    def __init__(self, stockfish_path="./stockfish.exe", movetime=50, num_evaluators=2):
-        self.stockfish_path = stockfish_path
-        self.movetime = movetime
-        self.num_evaluators = num_evaluators
-        self.evaluators = []
-        self.initialized = False
-        
-        print(f"🚀 Initializing {num_evaluators} parallel Stockfish evaluators...")
-        self._init_parallel_engines()
-    
-    def _init_parallel_engines(self):
-        """Initialize multiple Stockfish engines for parallel processing"""
-        import threading
-        
-        self.evaluators = []
-        init_threads = []
-        init_results = []
-        
-        def init_single_evaluator(evaluator_id):
-            try:
-                evaluator = StockfishEvaluator(
-                    stockfish_path=self.stockfish_path, 
-                    movetime=self.movetime
-                )
-                evaluator.evaluator_id = evaluator_id
-                init_results.append((evaluator_id, evaluator, True))
-                print(f"✅ Evaluator {evaluator_id} initialized successfully")
-            except Exception as e:
-                print(f"❌ Failed to initialize evaluator {evaluator_id}: {e}")
-                init_results.append((evaluator_id, None, False))
-        
-        # Initialize evaluators in parallel
-        for i in range(self.num_evaluators):
-            thread = threading.Thread(target=init_single_evaluator, args=(i,))
-            init_threads.append(thread)
-            thread.start()
-        
-        # Wait for all initializations to complete
-        for thread in init_threads:
-            thread.join()
-        
-        # Collect successfully initialized evaluators
-        init_results.sort(key=lambda x: x[0])  # Sort by evaluator_id
-        for evaluator_id, evaluator, success in init_results:
-            if success and evaluator:
-                self.evaluators.append(evaluator)
-        
-        if len(self.evaluators) > 0:
-            self.initialized = True
-            print(f"🎯 Successfully initialized {len(self.evaluators)}/{self.num_evaluators} parallel evaluators")
-        else:
-            print("❌ Failed to initialize any parallel evaluators")
-            self.initialized = False
-    
-    def evaluate_positions_parallel(self, fens):
-        """
-        Evaluate multiple positions in parallel using available evaluators
-        
-        Args:
-            fens: List of FEN strings to evaluate
-            
-        Returns:
-            List of move evaluations for each position
-        """
-        if not self.initialized or len(self.evaluators) == 0:
-            print("⚠️ Parallel evaluators not initialized, exit")
-            exit(0)
-        
-        import threading
-        import queue
-        import time
-        
-        # Create work queue and result storage
-        work_queue = queue.Queue()
-        results = {}
-        results_lock = threading.Lock()
-        start_time_global = time.time()
-        
-        # Add all positions to work queue
-        for i, fen in enumerate(fens):
-            work_queue.put((i, fen))
-        
-        def worker_thread(evaluator, thread_id):
-            """Worker thread function for parallel evaluation"""
-            processed_count = 0
-            while True:
-                try:
-                    # Get work item with timeout
-                    position_idx, fen = work_queue.get(timeout=1.0)
-                    
-                    # Evaluate position using top-k moves for speed
-                    start_time = time.time()
-                    # Get top k moves instead of all legal moves
-                    top_moves = evaluator.get_top_k_moves(fen, k=5)
-                    
-                    move_evaluations = []
-                    board = chess.Board(fen)
-                    for move_uci, score_cp in top_moves:
-                        try:
-                            move = chess.Move.from_uci(move_uci)
-                            move_evaluations.append(((move.from_square, move.to_square), score_cp))
-                        except:
-                            continue # Ignore invalid moves
-                    
-                    eval_time = time.time() - start_time
-                    
-                    # Store result thread-safely
-                    with results_lock:
-                        results[position_idx] = move_evaluations
-                    
-                    processed_count += 1
-                    
-                    # Progress update for this thread with ETA
-                    if thread_id == 0 and processed_count % 5 == 0:
-                        with results_lock:
-                            total_completed = len(results)
-                        elapsed = time.time() - start_time_global
-                        rate = total_completed / elapsed if elapsed > 0 else 0
-                        remaining = len(fens) - total_completed
-                        eta = remaining / rate / 60 if rate > 0 else float('inf')
-                        percent = (total_completed / len(fens)) * 100
-                        print(f"🔄 Thread {thread_id}: {total_completed}/{len(fens)} positions "
-                              f"({percent:.1f}%) processed | Rate: {rate:.2f} pos/s | ETA: {eta:.1f} min")
-                    
-                    work_queue.task_done()
-                    
-                except queue.Empty:
-                    # No more work available
-                    break
-                except Exception as e:
-                    print(f"⚠️ Worker thread {thread_id} error: {e}")
-                    work_queue.task_done()
-                    continue
-        
-        # Start worker threads
-        threads = []
-        for i, evaluator in enumerate(self.evaluators):
-            thread = threading.Thread(target=worker_thread, args=(evaluator, i))
-            thread.daemon = True
-            threads.append(thread)
-            thread.start()
-        
-        # Wait for all work to complete
-        print(f"⚡ Processing {len(fens)} positions with {len(self.evaluators)} parallel evaluators...")
-        start_time = time.time()
-        
-        work_queue.join()  # Wait for all tasks to be completed
-        
-        # Wait for threads to finish
-        for thread in threads:
-            thread.join(timeout=5.0)
-        
-        elapsed_time = time.time() - start_time
-        
-        # Convert results dict back to ordered list
-        ordered_results = []
-        for i in range(len(fens)):
-            if i in results:
-                ordered_results.append(results[i])
-            else:
-                print(f"⚠️ Missing result for position {i}, using empty evaluation")
-                ordered_results.append([])
-        
-        # Performance statistics
-        total_moves = sum(len(moves) for moves in ordered_results)
-        avg_moves_per_pos = total_moves / len(ordered_results) if ordered_results else 0
-        positions_per_sec = len(fens) / elapsed_time if elapsed_time > 0 else 0
-        
-        print(f"✅ Parallel evaluation completed in {elapsed_time:.1f}s")
-        print(f"   📊 Positions: {len(ordered_results):,}")
-        print(f"   📊 Total moves: {total_moves:,}")
-        print(f"   📊 Avg moves/position: {avg_moves_per_pos:.1f}")
-        print(f"   ⚡ Rate: {positions_per_sec:.2f} positions/second")
-        print(f"   🚀 Speedup: ~{len(self.evaluators):.1f}x theoretical")
-        
-        return ordered_results
-    
-    def close(self):
-        """Close all parallel evaluators"""
-        print(f"🔌 Closing {len(self.evaluators)} parallel evaluators...")
-        
-        for i, evaluator in enumerate(self.evaluators):
-            try:
-                evaluator.close()
-                print(f"✅ Evaluator {i} closed")
-            except Exception as e:
-                print(f"⚠️ Error closing evaluator {i}: {e}")
-        
-        self.evaluators = []
-        self.initialized = False
-        print("🔌 All parallel evaluators closed")
-    
-    def __del__(self):
-        """Cleanup when object is destroyed"""
-        self.close()
+# Import StockfishEvaluator and ParallelStockfishEvaluator from the new module
+from stockfish_eval import StockfishEvaluator, ParallelStockfishEvaluator
 
 def create_dataset_from_games(max_positions=10000):
     """
@@ -957,27 +599,16 @@ def create_dataset_from_games(max_positions=10000):
     print("\n🎮 Creating dataset from games with Stockfish evaluation...")
     print(f"🎯 Target positions: {max_positions:,}")
 
-    avg_positions_per_game = 22
-    log_factor = math.log10(max(max_positions, 1000))
-    base_ratio = 0.5
-    scale_factor = (log_factor - 3.0) / 4.0
-    scale_factor = max(0, min(1, scale_factor))
-    puzzle_ratio = base_ratio - (scale_factor * 0.35)
+    puzzle_ratio = 0.4
     pgn_ratio = 1.0 - puzzle_ratio
     pgn_target_positions = int(max_positions * pgn_ratio)
-    estimated_games_needed = max(1000, int(pgn_target_positions / avg_positions_per_game))
-
-    print(f"🎯 Automatic scaling for {max_positions:,} positions:")
-    print(f"   📊 PGN ratio: {pgn_ratio:.1%} → {pgn_target_positions:,} positions")
-    print(f"   🧩 Puzzle ratio: {puzzle_ratio:.1%} → {int(max_positions * puzzle_ratio):,} positions")
-    print(f"   🎮 Estimated games needed: {estimated_games_needed:,}")
-
+    
     print(f"📥 Loading PGN games...")
     try:
         pgn_states, pgn_policies, pgn_fens = load_pgn_data(
             "./lichess_db_standard_rated_2013-07.pgn",
-            fen_to_tensor,
-            max_games=estimated_games_needed,
+            fen_to_bitboard_tensor,
+            max_positions=pgn_target_positions,
             max_moves=30,
             min_elo=1600
         )
@@ -992,7 +623,7 @@ def create_dataset_from_games(max_positions=10000):
     try:
         puzzle_states, puzzle_policies, puzzle_fens = load_puzzle_data(
             "./lichess_db_puzzle.csv",
-            fen_to_tensor,
+            fen_to_bitboard_tensor,
             max_puzzles=puzzle_target,
             min_rating=800,
             max_rating=2500
@@ -1007,7 +638,7 @@ def create_dataset_from_games(max_positions=10000):
     print(f"   🧩 Puzzle positions: {len(puzzle_states):,}")
 
     all_states = pgn_states + puzzle_states
-    all_fens = pgn_fens + puzzle_fens
+    all_policies = pgn_policies + puzzle_policies
 
     if len(all_states) == 0:
         print("❌ No training data available!")
@@ -1028,34 +659,20 @@ def create_dataset_from_games(max_positions=10000):
         print(f"🎯 Randomly selecting {max_positions:,} positions from {len(all_states):,} available")
         indices = np.random.choice(len(all_states), max_positions, replace=False)
         all_states = [all_states[i] for i in indices]
-        all_fens = [all_fens[i] for i in indices]
+        all_policies = [all_policies[i] for i in indices]
 
-    print(f"🤖 Starting comprehensive Stockfish evaluation with PARALLEL processing...")
-    print("📊 Now evaluating TOP K moves for each position using parallel evaluators")
-    print("🚀 This should be significantly faster than the old method!")
+    # Combine policies directly from PGN and puzzle sources
+    combined_policies = all_policies
+    combined_states = all_states
 
-    start_time = time.time()
-
-    # Use parallel evaluator instead of sequential
-    parallel_evaluator = ParallelStockfishEvaluator(movetime=50, num_evaluators=15)
-    
-    # Process all positions in parallel
-    processed_policies = parallel_evaluator.evaluate_positions_parallel(all_fens)
-    processed_states = all_states  # States don't need processing, just copy
-    
-    parallel_evaluator.close()
-
-    total_moves = sum(len(moves) for moves in processed_policies)
-    elapsed_total = time.time() - start_time
-    
-    print(f"\n✅ COMPREHENSIVE policy dataset created in {elapsed_total/60:.1f} minutes!")
-    print(f"   📊 Positions evaluated: {len(processed_states):,}")
-    print(f"   📊 Total moves evaluated: {total_moves:,}")
-    print(f"   📊 Average moves per position: {total_moves/len(processed_states):.1f}")
-    print(f"   ⚡ Average rate: {len(processed_states)/elapsed_total:.2f} positions/second")
-    print(f"   🎯 Training data richness: {total_moves/len(processed_states):.1f}x more comprehensive than single-move approach")
-
-    return processed_states, processed_policies
+    print(f"\n✅ Policy dataset created WITHOUT Stockfish evaluation!")
+    print(f"   📊 Positions: {len(combined_states):,}")
+    print(f"   📊 Policies: {len(combined_policies):,}")
+    if len(combined_states) > 0:
+        total_moves = sum(1 if isinstance(p, tuple) else len(p) for p in combined_policies)
+        print(f"   📊 Total moves (sum of all policy entries): {total_moves:,}")
+        print(f"   📊 Average moves per position: {total_moves/len(combined_states):.2f}")
+    return combined_states, combined_policies
 
 if __name__ == "__main__":
     print("🏗️ HRM CHESS MODEL TRAINING")
@@ -1102,7 +719,7 @@ if __name__ == "__main__":
         avg_moves_per_position = total_moves_in_dataset / len(states) if states else 0
         
         dataset_info = {
-            'states': np.array(states, dtype=np.float32),
+            'states': np.array(states, dtype=np.uint64),
             'policies': policies,
             'info': {
                 'created': time.time(),
@@ -1173,7 +790,7 @@ if __name__ == "__main__":
     print(f"   🖥️ GPU Level: {gpu_config['optimization_level']}")
     
     # HRM modell létrehozása optimalizált paraméterekkel
-    model = HRMChess(input_dim=72, hidden_dim=hidden_dim, N=N, T=T).to(device)
+    model = HRMChess(input_dim=20, hidden_dim=hidden_dim, N=N, T=T).to(device)
     
     # Model info
     total_params = sum(p.numel() for p in model.parameters())
@@ -1209,6 +826,15 @@ if __name__ == "__main__":
     
     # Memory usage estimation
     estimated_memory_per_batch = (batch_size * 72 * 4 + batch_size * 64 * 64 * 4) / (1024**3)  # Rough estimate in GB
+    print(f"   📊 Estimated memory/batch: ~{estimated_memory_per_batch:.2f} GB)")
+    print(f"   • HRM steps: {N}×{T}={N*T}")
+    print(f"   • Parameters: {total_params:,}")
+    print(f"   • Dataset: {dataset_size:,} positions")
+    print(f"   🖥️ GPU: {gpu_config['device_name']} ({gpu_config['memory_gb']:.1f} GB)")
+    print(f"   🏷️ Optimization Level: {gpu_config['optimization_level']}")
+    
+    # Memory usage estimation
+    estimated_memory_per_batch = (batch_size * 72 * 4 + batch_size * 64 * 64 * 4) / (1024**3)  # Rough estimate in GB
     print(f"   📊 Estimated memory/batch: ~{estimated_memory_per_batch:.2f} GB")
     
     # Create Policy dataset
@@ -1226,7 +852,7 @@ if __name__ == "__main__":
             'hidden_dim': hidden_dim,
             'N': N,
             'T': T,
-            'input_dim': 72
+            'input_dim': 20
         },
         'training_info': {
             'epochs': epochs,
