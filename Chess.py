@@ -562,7 +562,7 @@ def get_manual_parameters():
 
 
 class StockfishEvaluator:
-    """Stockfish motor integráció pozíció értékeléshez - PERZISZTENS KAPCSOLAT"""
+    """Stockfish motor integráció pozíció értékeléshez - EGYSZERŰ READLINE MEGKÖZELÍTÉS"""
     
     def __init__(self, stockfish_path="./stockfish.exe", movetime=50):
         self.stockfish_path = stockfish_path
@@ -572,7 +572,7 @@ class StockfishEvaluator:
         self._init_engine()
     
     def _init_engine(self):
-        """Stockfish motor inicializálás - HÁTTÉR PROCESS"""
+        """Stockfish motor inicializálás - egyszerű megközelítés"""
         try:
             if os.path.exists(self.stockfish_path):
                 print(f"🤖 Stockfish found: {self.stockfish_path}")
@@ -582,26 +582,25 @@ class StockfishEvaluator:
                 # Try system stockfish
                 self.stockfish_path = "stockfish"
             
-            # Start persistent Stockfish process
-            print("🚀 Starting persistent Stockfish engine...")
+            # Start Stockfish process with simple configuration
+            print("🚀 Starting Stockfish engine...")
             self.process = subprocess.Popen(
                 [self.stockfish_path],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                bufsize=1,  # Line buffered
                 universal_newlines=True
             )
             
-            # Initialize UCI
+            # Simple UCI initialization
             self._send_command("uci")
             self._wait_for_response("uciok")
             
             self._send_command("isready")
             self._wait_for_response("readyok")
             
-            print("✅ Persistent Stockfish engine ready!")
+            print("✅ Stockfish engine ready!")
             self.initialized = True
             
         except Exception as e:
@@ -609,135 +608,189 @@ class StockfishEvaluator:
             self.initialized = False
     
     def _send_command(self, command):
-        """Send command to Stockfish"""
+        """Send command to Stockfish - egyszerű megközelítés"""
         if self.process and self.process.stdin:
             try:
                 self.process.stdin.write(command + "\n")
                 self.process.stdin.flush()
-            except:
+            except Exception as e:
+                print(f"⚠️ Error sending command: {e}")
                 self.initialized = False
     
-    def _read_line(self, timeout=2.0):
-        """Read a line from Stockfish with timeout - Windows kompatibilis"""
+    def _read_line(self, timeout=3.0):
+        """Read a line from Stockfish - EGYSZERŰ READLINE"""
         if not self.process or not self.process.stdout:
             return None
         
         try:
-            # Windows-friendly approach - poll and readline
-            import time
-            start_time = time.time()
+            # Simple readline with basic timeout using threading
+            import threading
+            import queue
             
-            while time.time() - start_time < timeout:
-                # Check if process is still alive
-                if self.process.poll() is not None:
-                    return None
-                
-                # Try to read a line (non-blocking simulation)
+            result_queue = queue.Queue()
+            
+            def read_line():
                 try:
-                    # This will block, but we have a short timeout
                     line = self.process.stdout.readline()
-                    if line:
-                        return line.strip()
-                except:
-                    break
-                
-                # Small sleep to prevent busy waiting
-                time.sleep(0.01)
+                    result_queue.put(line)
+                except Exception as e:
+                    result_queue.put(None)
+            
+            # Start reading thread
+            thread = threading.Thread(target=read_line)
+            thread.daemon = True
+            thread.start()
+            
+            # Wait for result with timeout
+            thread.join(timeout=timeout)
+            
+            if not result_queue.empty():
+                line = result_queue.get_nowait()
+                if line:
+                    return line.strip()
+            
+            return None
             
         except Exception as e:
             return None
-        
-        return None
     
     def _wait_for_response(self, expected, timeout=5.0):
-        """Wait for specific response from Stockfish"""
+        """Wait for specific response from Stockfish - egyszerű megközelítés"""
         start_time = time.time()
         while time.time() - start_time < timeout:
-            line = self._read_line(0.1)
+            line = self._read_line(1.0)  # 1 second timeout per line
             if line and expected in line:
                 return True
+            if not line:  # If no line received, continue waiting
+                continue
         return False
-    
-    def evaluate_position(self, fen):
+
+    def evaluate_all_legal_moves(self, fen):
         """
-        Pozíció értékelése Stockfish-sel
-        Returns: (best_move_uci, evaluation_score)
+        Összes legális lépés értékelése Stockfish-sel - EGYSZERŰSÍTETT VERZIÓ + UCINEWGAME
+        Returns: List of (move_tuple, evaluation_score) for all legal moves
         """
         if not self.initialized or not self.process:
-            return None, 0.0
+            print("⚠️ Stockfish engine not initialized")
+            return []
         
         try:
-            # Set position
-            self._send_command(f"position fen {fen}")
+            # Reset engine state before evaluation
+            self._send_command("ucinewgame")
+            self._send_command("isready")
+            self._wait_for_response("readyok", timeout=2.0)
             
-            # Get evaluation with limited thinking time
-            self._send_command(f"go movetime {self.movetime}")
+            # Create board from FEN to get legal moves
+            board = chess.Board(fen)
+            legal_moves = list(board.legal_moves)
             
-            # Parse response - simplified approach for Windows
-            best_move = None
-            score = 0.0
-            lines_read = 0
-            max_lines = 50  # Limit reading to prevent hanging
+            if not legal_moves:
+                return []
             
-            while lines_read < max_lines:
+            move_evaluations = []
+            
+            # Evaluate each legal move with simplified approach
+            for move in legal_moves:
+                move_tuple = (move.from_square, move.to_square)
+                score = 0.0  # Default neutral score
+                
                 try:
-                    line = self.process.stdout.readline()
-                    if not line:
-                        break
+                    # Check if process is still alive
+                    if self.process.poll() is not None:
+                        print("⚠️ Stockfish process died, restarting...")
+                        self._init_engine()
+                        if not self.initialized:
+                            move_evaluations.append((move_tuple, score))
+                            continue
                     
-                    line = line.strip()
-                    lines_read += 1
+                    # Make the move on a copy of the board
+                    temp_board = board.copy()
+                    temp_board.push(move)
                     
-                    if line.startswith('bestmove'):
-                        parts = line.split()
-                        if len(parts) >= 2 and parts[1] != "(none)":
-                            best_move = parts[1]
-                        break
-                    elif 'score cp' in line:
-                        # Extract centipawn score
-                        try:
-                            parts = line.split()
-                            for i, part in enumerate(parts):
-                                if part == "cp" and i + 1 < len(parts):
-                                    cp_score = int(parts[i + 1])
-                                    score = max(-1.0, min(1.0, cp_score / 300.0))
-                                    break
-                        except:
-                            pass
-                    elif 'score mate' in line:
-                        # Mate score
-                        try:
-                            parts = line.split()
-                            for i, part in enumerate(parts):
-                                if part == "mate" and i + 1 < len(parts):
-                                    mate_moves = int(parts[i + 1])
-                                    score = 1.0 if mate_moves > 0 else -1.0
-                                    break
-                        except:
-                            pass
-                            
+                    # Get the resulting position FEN
+                    new_fen = temp_board.fen()
+                    
+                    # Set position after the move
+                    self._send_command(f"position fen {new_fen}")
+                    
+                    # Get evaluation with short thinking time
+                    eval_time = max(10, self.movetime // 4)  # Minimum 10ms
+                    self._send_command(f"go movetime {eval_time}")
+                    
+                    # Parse response - simplified approach
+                    evaluation_successful = False
+                    max_attempts = 10
+                    attempts = 0
+                    
+                    while attempts < max_attempts and not evaluation_successful:
+                        line = self._read_line(1.0)  # 1 second timeout per line
+                        if not line:
+                            attempts += 1
+                            continue
+                        
+                        attempts += 1
+                        
+                        if line.startswith('bestmove'):
+                            evaluation_successful = True
+                            break
+                        elif 'score cp' in line:
+                            # Extract centipawn score
+                            try:
+                                parts = line.split()
+                                for i, part in enumerate(parts):
+                                    if part == "cp" and i + 1 < len(parts):
+                                        cp_score = int(parts[i + 1])
+                                        # Negate score because we're evaluating from opponent's perspective
+                                        score = max(-1.0, min(1.0, -cp_score / 300.0))
+                                        break
+                            except (ValueError, IndexError):
+                                pass
+                        elif 'score mate' in line:
+                            # Mate score
+                            try:
+                                parts = line.split()
+                                for i, part in enumerate(parts):
+                                    if part == "mate" and i + 1 < len(parts):
+                                        mate_moves = int(parts[i + 1])
+                                        # Negate because we're evaluating from opponent's perspective
+                                        score = -1.0 if mate_moves > 0 else 1.0
+                                        break
+                            except (ValueError, IndexError):
+                                pass
+                    
+                    move_evaluations.append((move_tuple, score))
+                    
                 except Exception as e:
-                    break
+                    # If evaluation fails for this move, assign neutral score
+                    move_evaluations.append((move_tuple, 0.0))
+                    continue
             
-            return best_move, score
+            return move_evaluations
             
         except Exception as e:
             print(f"⚠️ Stockfish evaluation error: {e}")
-            return None, 0.0
+            # Fallback: return all legal moves with neutral scores
+            try:
+                board = chess.Board(fen)
+                legal_moves = list(board.legal_moves)
+                return [(move.from_square, move.to_square, 0.0) for move in legal_moves]
+            except:
+                return []
     
     def close(self):
-        """Close Stockfish engine"""
+        """Close Stockfish engine - egyszerű cleanup"""
         if self.process:
             try:
                 self._send_command("quit")
                 self.process.terminate()
-                self.process.wait(timeout=2)
+                self.process.wait(timeout=3)
             except:
                 if self.process:
                     self.process.kill()
-            self.process = None
-            self.initialized = False
-            print("🔌 Stockfish engine closed")
+            finally:
+                self.process = None
+                self.initialized = False
+                print("🔌 Stockfish engine closed")
     
     def __del__(self):
         """Cleanup when object is destroyed"""
@@ -829,7 +882,8 @@ def create_dataset_from_games(max_positions=10000):
         all_states = [all_states[i] for i in indices]
         all_fens = [all_fens[i] for i in indices]
 
-    print(f"🤖 Starting Stockfish evaluation...")
+    print(f"🤖 Starting comprehensive Stockfish evaluation...")
+    print("📊 Now evaluating ALL legal moves for each position (this will take longer but provide richer training data)")
     print("📊 Progress updates will appear as positions are evaluated...")
 
     processed_states = []
@@ -837,45 +891,42 @@ def create_dataset_from_games(max_positions=10000):
     
     start_time = time.time()
 
-    # Use single StockfishEvaluator instance
-    evaluator = StockfishEvaluator()
+    evaluator = StockfishEvaluator(movetime=50)
     
     for i, fen in enumerate(all_fens):
         state = all_states[i]
-        best_move, score = evaluator.evaluate_position(fen)
         
-        # Convert to move_scores format for compatibility
-        if best_move:
-            try:
-                board = chess.Board(fen)
-                move = chess.Move.from_uci(best_move)
-                move_tuple = (move.from_square, move.to_square)
-                move_scores = [(move_tuple, score)]
-            except:
-                move_scores = []
-        else:
-            move_scores = []
+        # NEW: Evaluate ALL legal moves instead of just the best one
+        move_evaluations = evaluator.evaluate_all_legal_moves(fen)
         
         processed_states.append(state)
-        processed_policies.append(move_scores)
+        processed_policies.append(move_evaluations)
         
-        # Progress update every 10 positions
-        if (i + 1) % 10 == 0 or (i + 1) == len(all_fens):
+        # Progress update every 5 positions (more frequent due to longer processing)
+        if (i + 1) % 5 == 0 or (i + 1) == len(all_fens):
             elapsed = time.time() - start_time
             rate = (i + 1) / elapsed if elapsed > 0 else 0
             eta = (len(all_fens) - (i + 1)) / rate if rate > 0 else 0
-            print(f"📈 Progress: {i + 1}/{len(all_fens):,} positions evaluated | "
-                  f"Rate: {rate:.1f} pos/s | ETA: {eta/60:.1f} min")
+            
+            # Calculate average moves per position for this batch
+            total_moves_so_far = sum(len(moves) for moves in processed_policies)
+            avg_moves_per_pos = total_moves_so_far / len(processed_policies) if processed_policies else 0
+            
+            print(f"📈 Progress: {i + 1}/{len(all_fens):,} positions | "
+                  f"Rate: {rate:.2f} pos/s | ETA: {eta/60:.1f} min | "
+                  f"Avg moves/pos: {avg_moves_per_pos:.1f}")
     
     evaluator.close()
 
     total_moves = sum(len(moves) for moves in processed_policies)
     elapsed_total = time.time() - start_time
     
-    print(f"\n✅ Policy dataset created in {elapsed_total/60:.1f} minutes!")
+    print(f"\n✅ COMPREHENSIVE policy dataset created in {elapsed_total/60:.1f} minutes!")
     print(f"   📊 Positions evaluated: {len(processed_states):,}")
     print(f"   📊 Total moves evaluated: {total_moves:,}")
-    print(f"   ⚡ Average rate: {len(processed_states)/elapsed_total:.1f} positions/second")
+    print(f"   📊 Average moves per position: {total_moves/len(processed_states):.1f}")
+    print(f"   ⚡ Average rate: {len(processed_states)/elapsed_total:.2f} positions/second")
+    print(f"   🎯 Training data richness: {total_moves/len(processed_states):.1f}x more comprehensive than single-move approach")
 
     return processed_states, processed_policies
 
@@ -920,18 +971,24 @@ if __name__ == "__main__":
         
         # Save dataset
         print("💾 Saving dataset...")
+        # Calculate average moves per position from the policies data
+        total_moves_in_dataset = sum(len(moves) for moves in policies)
+        avg_moves_per_position = total_moves_in_dataset / len(states) if states else 0
+        
         dataset_info = {
             'states': np.array(states, dtype=np.float32),
             'policies': policies,
             'info': {
                 'created': time.time(),
-                'source': 'PGN + Tactical Puzzles (Stockfish evaluation)',
+                'source': 'PGN + Tactical Puzzles (Comprehensive Stockfish evaluation)',
                 'positions': len(states),
-                'stockfish_depth': 'simplified',
+                'stockfish_evaluation': 'ALL_LEGAL_MOVES',
+                'evaluation_method': 'comprehensive_move_evaluation',
                 'data_mix': 'Balanced PGN games + tactical puzzles',
                 'gpu_optimized': True,
                 'gpu_config': gpu_config,
-                'user_specified_size': max_positions
+                'user_specified_size': max_positions,
+                'avg_moves_per_position': avg_moves_per_position
             }
         }
         
