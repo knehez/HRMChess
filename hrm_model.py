@@ -32,15 +32,12 @@ class PolicyDataset(torch.utils.data.Dataset):
                 
                 for move_tuple, score in moves:
                     move_tuples.append(move_tuple)
-                    # Convert Stockfish score to positive value (higher = better)
-                    # Stockfish scores are from model's perspective, so negate them
-                    scores.append(-score)  # Negate because we want higher scores for better moves
-                
+                    scores.append(score)                
                 # Convert scores to probabilities using softmax with temperature
                 if len(scores) > 0:
                     scores_tensor = torch.tensor(scores, dtype=torch.float32)
                     # Use temperature to control sharpness (lower = more focused)
-                    temperature = 2.0
+                    temperature = 0.2
                     probabilities = torch.softmax(scores_tensor / temperature, dim=0)
                     
                     # Assign probabilities to policy matrix
@@ -126,25 +123,24 @@ class HRMChess(nn.Module):
         
         # Policy head - move prediction
         self.policy_head = nn.Sequential(
-            nn.Linear(hidden_dim, 64*64),
-            nn.Tanh()
+            nn.Linear(hidden_dim, 64*64)
         )
         
         # Value head eltávolítva
     
     def forward(self, x, z_init=None):
         """
-        Konvolúciós HRM implementation head-del:
-        - Input: 72 dimenziós vektor (64 mező + 8 extra info)
-        - 2D Konvolúció a sakktábla reprezentációhoz
-        - Output: Policy (64x64)
+        A konvolúciós HRM modell forward pass-a.
+        - Bemenet: 72 dimenziós vektor (64 mező + 8 extra info).
+        - A 64 mezőt 2D konvolúcióval dolgozza fel.
+        - A kimenet egy policy mátrix (64x64), ami a lépés-valószínűségeket tartalmazza.
         
         Args:
-            x: Input tensor (batch, 72)
-            z_init: Initial HRM states (optional)
+            x: Bemeneti tenzor (batch, 72).
+            z_init: Kezdeti HRM állapotok (opcionális).
             
         Returns:
-            move_logits: (batch, 64, 64) policy matrix
+            move_logits: (batch, 64, 64) méretű policy mátrix.
         """
         batch_size = x.size(0)
         device = x.device
@@ -157,7 +153,7 @@ class HRMChess(nn.Module):
         board_2d = board_squares.view(batch_size, 1, 8, 8)
         
         # Process board with simplified 2D convolution
-        board_features = self.board_conv(board_2d)  # (batch, 4 * hidden_dim//8)
+        board_features = self.board_conv(board_2d)  # (batch, 64 * hidden_dim)
         
         # Process extra info
         extra_features = self.extra_processor(extra_info)  # (batch, hidden_dim//4)
@@ -203,19 +199,15 @@ class HRMChess(nn.Module):
 
 def train_step(model, batch, optimizer, temperature=1.0, n_supervision=1):
     """
-    HRM training step támogatással:
-    - Policy loss: Cross entropy
-    - Value loss: MSE (opcionális)
-    - Combined loss weighting
+    HRM training step, kizárólag policy-tanításhoz.
+    - Policy loss: Cross-entropy alapú.
     
     Args:
-        model: HRMChess model
-        batch: (x, pi_star) vagy (x, pi_star, v_star) tuple
-        optimizer: Optimizer
-        temperature: Policy sharpening
-        n_supervision: Deep supervision steps
-        policy_weight: Policy loss weight
-        value_weight: Value loss weight (0 = csak policy)
+        model: HRMChess modell.
+        batch: (x, pi_star) tuple, ahol x a bemeneti állapot, pi_star a cél policy.
+        optimizer: Az optimalizáló.
+        temperature: A policy eloszlás élesítésére szolgáló paraméter.
+        n_supervision: Deep supervision lépések száma.
     """
     # Policy only training
     x, pi_star = batch[:2]
@@ -341,7 +333,6 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=2e-4, warmup_epochs=
                 current_lr = optimizer.param_groups[0]['lr']
                 warmup_progress = min(1.0, global_step / warmup_steps) * 100
                 print(f"Epoch {epoch}, Step {i}, Total loss: {loss_info['total_loss']:.4f}, "
-                        f"Value loss: {loss_info.get('value_loss', 0):.4f}, "
                         f"LR: {current_lr:.2e}, Warmup: {warmup_progress:.1f}%")
         
         # Validation phase

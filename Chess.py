@@ -665,117 +665,65 @@ class StockfishEvaluator:
                 continue
         return False
 
-    def evaluate_all_legal_moves(self, fen):
+    def get_top_k_moves(self, fen, k=3):
         """
-        Összes legális lépés értékelése Stockfish-sel - EGYSZERŰSÍTETT VERZIÓ + UCINEWGAME
-        Returns: List of (move_tuple, evaluation_score) for all legal moves
+        Visszaadja a legjobb k lépést a Stockfish 'MultiPV' funkciójával.
+        Returns: List of (move_uci, score_cp) tuples.
         """
         if not self.initialized or not self.process:
             print("⚠️ Stockfish engine not initialized")
             return []
-        
+
         try:
-            # Reset engine state before evaluation
+            # Set MultiPV to get top k moves
             self._send_command("ucinewgame")
-            self._send_command("isready")
-            self._wait_for_response("readyok", timeout=2.0)
+            self._send_command(f"setoption name MultiPV value {k}")
             
-            # Create board from FEN to get legal moves
-            board = chess.Board(fen)
-            legal_moves = list(board.legal_moves)
+            # Set position
+            self._send_command(f"position fen {fen}")
+            self._send_command(f"go movetime {self.movetime}")
+
+            top_moves = {}
+            start_time = time.time()
             
-            if not legal_moves:
-                return []
-            
-            move_evaluations = []
-            
-            # Evaluate each legal move with simplified approach
-            for move in legal_moves:
-                move_tuple = (move.from_square, move.to_square)
-                score = 0.0  # Default neutral score
-                
-                try:
-                    # Check if process is still alive
-                    if self.process.poll() is not None:
-                        print("⚠️ Stockfish process died, restarting...")
-                        self._init_engine()
-                        if not self.initialized:
-                            move_evaluations.append((move_tuple, score))
-                            continue
-                    
-                    # Make the move on a copy of the board
-                    temp_board = board.copy()
-                    temp_board.push(move)
-                    
-                    # Get the resulting position FEN
-                    new_fen = temp_board.fen()
-                    
-                    # Set position after the move
-                    self._send_command(f"position fen {new_fen}")
-                    
-                    # Get evaluation with short thinking time
-                    eval_time = max(10, self.movetime // 4)  # Minimum 10ms
-                    self._send_command(f"go movetime {eval_time}")
-                    
-                    # Parse response - simplified approach
-                    evaluation_successful = False
-                    max_attempts = 10
-                    attempts = 0
-                    
-                    while attempts < max_attempts and not evaluation_successful:
-                        line = self._read_line(1.0)  # 1 second timeout per line
-                        if not line:
-                            attempts += 1
-                            continue
-                        
-                        attempts += 1
-                        
-                        if line.startswith('bestmove'):
-                            evaluation_successful = True
-                            break
-                        elif 'score cp' in line:
-                            # Extract centipawn score
-                            try:
-                                parts = line.split()
-                                for i, part in enumerate(parts):
-                                    if part == "cp" and i + 1 < len(parts):
-                                        cp_score = int(parts[i + 1])
-                                        # Negate score because we're evaluating from opponent's perspective
-                                        score = max(-1.0, min(1.0, -cp_score / 300.0))
-                                        break
-                            except (ValueError, IndexError):
-                                pass
-                        elif 'score mate' in line:
-                            # Mate score
-                            try:
-                                parts = line.split()
-                                for i, part in enumerate(parts):
-                                    if part == "mate" and i + 1 < len(parts):
-                                        mate_moves = int(parts[i + 1])
-                                        # Negate because we're evaluating from opponent's perspective
-                                        score = -1.0 if mate_moves > 0 else 1.0
-                                        break
-                            except (ValueError, IndexError):
-                                pass
-                    
-                    move_evaluations.append((move_tuple, score))
-                    
-                except Exception as e:
-                    # If evaluation fails for this move, assign neutral score
-                    move_evaluations.append((move_tuple, 0.0))
+            # Read lines until 'bestmove' is found or timeout
+            while time.time() - start_time < (self.movetime / 1000) + 2: # movetime in ms + buffer
+                line = self._read_line(timeout=1.0)
+                if not line:
                     continue
+
+                if line.startswith('bestmove'):
+                    break
+
+                if 'multipv' in line and 'score cp' in line:
+                    parts = line.split()
+                    try:
+                        pv_index = parts.index('multipv') + 1
+                        move_index = parts.index('pv') + 1
+                        score_index = parts.index('cp') + 1
+                        
+                        rank = int(parts[pv_index])
+                        move_uci = parts[move_index]
+                        score_cp = int(parts[score_index])
+                        
+                        # Store the move if it's within the top k
+                        if rank <= k:
+                            top_moves[rank] = (move_uci, score_cp)
+
+                    except (ValueError, IndexError):
+                        continue
             
-            return move_evaluations
-            
+            # Reset MultiPV to 1 for other functions
+            self._send_command("setoption name MultiPV value 1")
+
+            # Return sorted list of moves
+            return [top_moves[i] for i in sorted(top_moves.keys())]
+
         except Exception as e:
-            print(f"⚠️ Stockfish evaluation error: {e}")
-            # Fallback: return all legal moves with neutral scores
-            try:
-                board = chess.Board(fen)
-                legal_moves = list(board.legal_moves)
-                return [(move.from_square, move.to_square, 0.0) for move in legal_moves]
-            except:
-                return []
+            print(f"⚠️ Error getting top k moves: {e}")
+            # Ensure MultiPV is reset on error
+            self._send_command("setoption name MultiPV value 1")
+            return []
     
     def close(self):
         """Close Stockfish engine - egyszerű cleanup"""
@@ -791,6 +739,206 @@ class StockfishEvaluator:
                 self.process = None
                 self.initialized = False
                 print("🔌 Stockfish engine closed")
+    
+    def __del__(self):
+        """Cleanup when object is destroyed"""
+        self.close()
+
+
+class ParallelStockfishEvaluator:
+    """Parallel Stockfish evaluator using 2 fixed processes for faster evaluation"""
+    
+    def __init__(self, stockfish_path="./stockfish.exe", movetime=50, num_evaluators=2):
+        self.stockfish_path = stockfish_path
+        self.movetime = movetime
+        self.num_evaluators = num_evaluators
+        self.evaluators = []
+        self.initialized = False
+        
+        print(f"🚀 Initializing {num_evaluators} parallel Stockfish evaluators...")
+        self._init_parallel_engines()
+    
+    def _init_parallel_engines(self):
+        """Initialize multiple Stockfish engines for parallel processing"""
+        import threading
+        
+        self.evaluators = []
+        init_threads = []
+        init_results = []
+        
+        def init_single_evaluator(evaluator_id):
+            try:
+                evaluator = StockfishEvaluator(
+                    stockfish_path=self.stockfish_path, 
+                    movetime=self.movetime
+                )
+                evaluator.evaluator_id = evaluator_id
+                init_results.append((evaluator_id, evaluator, True))
+                print(f"✅ Evaluator {evaluator_id} initialized successfully")
+            except Exception as e:
+                print(f"❌ Failed to initialize evaluator {evaluator_id}: {e}")
+                init_results.append((evaluator_id, None, False))
+        
+        # Initialize evaluators in parallel
+        for i in range(self.num_evaluators):
+            thread = threading.Thread(target=init_single_evaluator, args=(i,))
+            init_threads.append(thread)
+            thread.start()
+        
+        # Wait for all initializations to complete
+        for thread in init_threads:
+            thread.join()
+        
+        # Collect successfully initialized evaluators
+        init_results.sort(key=lambda x: x[0])  # Sort by evaluator_id
+        for evaluator_id, evaluator, success in init_results:
+            if success and evaluator:
+                self.evaluators.append(evaluator)
+        
+        if len(self.evaluators) > 0:
+            self.initialized = True
+            print(f"🎯 Successfully initialized {len(self.evaluators)}/{self.num_evaluators} parallel evaluators")
+        else:
+            print("❌ Failed to initialize any parallel evaluators")
+            self.initialized = False
+    
+    def evaluate_positions_parallel(self, fens):
+        """
+        Evaluate multiple positions in parallel using available evaluators
+        
+        Args:
+            fens: List of FEN strings to evaluate
+            
+        Returns:
+            List of move evaluations for each position
+        """
+        if not self.initialized or len(self.evaluators) == 0:
+            print("⚠️ Parallel evaluators not initialized, exit")
+            exit(0)
+        
+        import threading
+        import queue
+        import time
+        
+        # Create work queue and result storage
+        work_queue = queue.Queue()
+        results = {}
+        results_lock = threading.Lock()
+        start_time_global = time.time()
+        
+        # Add all positions to work queue
+        for i, fen in enumerate(fens):
+            work_queue.put((i, fen))
+        
+        def worker_thread(evaluator, thread_id):
+            """Worker thread function for parallel evaluation"""
+            processed_count = 0
+            while True:
+                try:
+                    # Get work item with timeout
+                    position_idx, fen = work_queue.get(timeout=1.0)
+                    
+                    # Evaluate position using top-k moves for speed
+                    start_time = time.time()
+                    # Get top k moves instead of all legal moves
+                    top_moves = evaluator.get_top_k_moves(fen, k=5)
+                    
+                    move_evaluations = []
+                    board = chess.Board(fen)
+                    for move_uci, score_cp in top_moves:
+                        try:
+                            move = chess.Move.from_uci(move_uci)
+                            move_evaluations.append(((move.from_square, move.to_square), score_cp))
+                        except:
+                            continue # Ignore invalid moves
+                    
+                    eval_time = time.time() - start_time
+                    
+                    # Store result thread-safely
+                    with results_lock:
+                        results[position_idx] = move_evaluations
+                    
+                    processed_count += 1
+                    
+                    # Progress update for this thread with ETA
+                    if thread_id == 0 and processed_count % 5 == 0:
+                        with results_lock:
+                            total_completed = len(results)
+                        elapsed = time.time() - start_time_global
+                        rate = total_completed / elapsed if elapsed > 0 else 0
+                        remaining = len(fens) - total_completed
+                        eta = remaining / rate / 60 if rate > 0 else float('inf')
+                        percent = (total_completed / len(fens)) * 100
+                        print(f"🔄 Thread {thread_id}: {total_completed}/{len(fens)} positions "
+                              f"({percent:.1f}%) processed | Rate: {rate:.2f} pos/s | ETA: {eta:.1f} min")
+                    
+                    work_queue.task_done()
+                    
+                except queue.Empty:
+                    # No more work available
+                    break
+                except Exception as e:
+                    print(f"⚠️ Worker thread {thread_id} error: {e}")
+                    work_queue.task_done()
+                    continue
+        
+        # Start worker threads
+        threads = []
+        for i, evaluator in enumerate(self.evaluators):
+            thread = threading.Thread(target=worker_thread, args=(evaluator, i))
+            thread.daemon = True
+            threads.append(thread)
+            thread.start()
+        
+        # Wait for all work to complete
+        print(f"⚡ Processing {len(fens)} positions with {len(self.evaluators)} parallel evaluators...")
+        start_time = time.time()
+        
+        work_queue.join()  # Wait for all tasks to be completed
+        
+        # Wait for threads to finish
+        for thread in threads:
+            thread.join(timeout=5.0)
+        
+        elapsed_time = time.time() - start_time
+        
+        # Convert results dict back to ordered list
+        ordered_results = []
+        for i in range(len(fens)):
+            if i in results:
+                ordered_results.append(results[i])
+            else:
+                print(f"⚠️ Missing result for position {i}, using empty evaluation")
+                ordered_results.append([])
+        
+        # Performance statistics
+        total_moves = sum(len(moves) for moves in ordered_results)
+        avg_moves_per_pos = total_moves / len(ordered_results) if ordered_results else 0
+        positions_per_sec = len(fens) / elapsed_time if elapsed_time > 0 else 0
+        
+        print(f"✅ Parallel evaluation completed in {elapsed_time:.1f}s")
+        print(f"   📊 Positions: {len(ordered_results):,}")
+        print(f"   📊 Total moves: {total_moves:,}")
+        print(f"   📊 Avg moves/position: {avg_moves_per_pos:.1f}")
+        print(f"   ⚡ Rate: {positions_per_sec:.2f} positions/second")
+        print(f"   🚀 Speedup: ~{len(self.evaluators):.1f}x theoretical")
+        
+        return ordered_results
+    
+    def close(self):
+        """Close all parallel evaluators"""
+        print(f"🔌 Closing {len(self.evaluators)} parallel evaluators...")
+        
+        for i, evaluator in enumerate(self.evaluators):
+            try:
+                evaluator.close()
+                print(f"✅ Evaluator {i} closed")
+            except Exception as e:
+                print(f"⚠️ Error closing evaluator {i}: {e}")
+        
+        self.evaluators = []
+        self.initialized = False
+        print("🔌 All parallel evaluators closed")
     
     def __del__(self):
         """Cleanup when object is destroyed"""
@@ -882,41 +1030,20 @@ def create_dataset_from_games(max_positions=10000):
         all_states = [all_states[i] for i in indices]
         all_fens = [all_fens[i] for i in indices]
 
-    print(f"🤖 Starting comprehensive Stockfish evaluation...")
-    print("📊 Now evaluating ALL legal moves for each position (this will take longer but provide richer training data)")
-    print("📊 Progress updates will appear as positions are evaluated...")
+    print(f"🤖 Starting comprehensive Stockfish evaluation with PARALLEL processing...")
+    print("📊 Now evaluating TOP K moves for each position using parallel evaluators")
+    print("🚀 This should be significantly faster than the old method!")
 
-    processed_states = []
-    processed_policies = []
-    
     start_time = time.time()
 
-    evaluator = StockfishEvaluator(movetime=50)
+    # Use parallel evaluator instead of sequential
+    parallel_evaluator = ParallelStockfishEvaluator(movetime=50, num_evaluators=15)
     
-    for i, fen in enumerate(all_fens):
-        state = all_states[i]
-        
-        # NEW: Evaluate ALL legal moves instead of just the best one
-        move_evaluations = evaluator.evaluate_all_legal_moves(fen)
-        
-        processed_states.append(state)
-        processed_policies.append(move_evaluations)
-        
-        # Progress update every 5 positions (more frequent due to longer processing)
-        if (i + 1) % 5 == 0 or (i + 1) == len(all_fens):
-            elapsed = time.time() - start_time
-            rate = (i + 1) / elapsed if elapsed > 0 else 0
-            eta = (len(all_fens) - (i + 1)) / rate if rate > 0 else 0
-            
-            # Calculate average moves per position for this batch
-            total_moves_so_far = sum(len(moves) for moves in processed_policies)
-            avg_moves_per_pos = total_moves_so_far / len(processed_policies) if processed_policies else 0
-            
-            print(f"📈 Progress: {i + 1}/{len(all_fens):,} positions | "
-                  f"Rate: {rate:.2f} pos/s | ETA: {eta/60:.1f} min | "
-                  f"Avg moves/pos: {avg_moves_per_pos:.1f}")
+    # Process all positions in parallel
+    processed_policies = parallel_evaluator.evaluate_positions_parallel(all_fens)
+    processed_states = all_states  # States don't need processing, just copy
     
-    evaluator.close()
+    parallel_evaluator.close()
 
     total_moves = sum(len(moves) for moves in processed_policies)
     elapsed_total = time.time() - start_time
@@ -929,7 +1056,6 @@ def create_dataset_from_games(max_positions=10000):
     print(f"   🎯 Training data richness: {total_moves/len(processed_states):.1f}x more comprehensive than single-move approach")
 
     return processed_states, processed_policies
-
 
 if __name__ == "__main__":
     print("🏗️ HRM CHESS MODEL TRAINING")
@@ -982,8 +1108,8 @@ if __name__ == "__main__":
                 'created': time.time(),
                 'source': 'PGN + Tactical Puzzles (Comprehensive Stockfish evaluation)',
                 'positions': len(states),
-                'stockfish_evaluation': 'ALL_LEGAL_MOVES',
-                'evaluation_method': 'comprehensive_move_evaluation',
+                'stockfish_evaluation': 'TOP_K_MOVES',
+                'evaluation_method': 'top_k_move_evaluation',
                 'data_mix': 'Balanced PGN games + tactical puzzles',
                 'gpu_optimized': True,
                 'gpu_config': gpu_config,
@@ -1006,7 +1132,7 @@ if __name__ == "__main__":
     policies = data['policies']
     info = data['info']
     
-    print(f"✅ Loaded dataset:")
+    print("✅ Loaded dataset:")
     print(f"   📊 Positions: {len(states):,}")
     print(f"   🤖 Source: {info.get('source', 'Unknown')}")
     print(f"   🎮 Data mix: {info.get('data_mix', 'Unknown composition')}")
