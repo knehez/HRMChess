@@ -23,7 +23,7 @@ app.secret_key = 'hrm_chess_secret_key_2025'  # Change in production
 
 class ChessGameManager:
     def __init__(self, model_path=None):
-        """Initialize the chess game manager with trained HRM model (Policy+Value compatible)"""
+        """Initialize the chess game manager with trained HRM model"""
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # If no model path provided, let user select
@@ -154,7 +154,7 @@ class ChessGameManager:
         return hidden_dim, N, T
         
     def load_model(self):
-        """Load the trained HRM model with auto-detection (Policy+Value compatible)"""
+        """Load the trained HRM model with auto-detection"""
         print(f"🎯 Loading HRM Chess model...")
         
         if not self.model_path:
@@ -245,18 +245,18 @@ class ChessGameManager:
         self.model.eval()
         
     def get_model_move(self, board):
-        """Get the best move from the HRM model (Policy+Value compatible)"""
+        """Get the best move from the HRM model"""
         try:
             # Convert board to tensor using simplified representation
             state = fen_to_tensor(board.fen())
             state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
             
             with torch.no_grad():
-                # HRM model prediction - handle both Policy-only and Policy+Value models
+                # HRM model prediction
                 model_output = self.model(state_tensor, return_value=True)
                 
                 if isinstance(model_output, tuple):
-                    # Policy+Value model: (move_logits, values)
+                    # model: move_logits
                     move_logits, values = model_output
                     position_value = values.item()
                 else:

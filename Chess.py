@@ -13,7 +13,7 @@ import time
 import math
 
 # Import HRM model and related functions
-from hrm_model import HRMChess, PolicyValueDataset, train_step, train_loop, quick_train_eval
+from hrm_model import HRMChess, PolicyDataset, train_step, train_loop, quick_train_eval
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -173,7 +173,7 @@ def detect_gpu_memory_and_optimize_training():
         
     except Exception as e:
         print(f"❌ GPU detection failed: {e}")
-        print("� Cannot proceed without GPU information.")
+        print(" Cannot proceed without GPU information.")
         exit(1)
 
 def load_pgn_data(pgn_path, fen_to_tensor, max_games=None, max_moves=40, min_elo=1600):
@@ -488,157 +488,6 @@ def fen_to_tensor(fen):
     
     return result
 
-def optuna_hyperparameter_optimization(states, policies, values, n_trials=20):
-    """
-    Optuna-based hyperparameter optimization Policy+Value modellhez
-    """
-    import optuna
-    from optuna.samplers import TPESampler
-    
-    print("\n🚀 OPTUNA HYPERPARAMETER OPTIMIZATION")
-    print("="*50)
-    print(f"Running {n_trials} intelligent trials with TPE sampler")
-    
-    dataset = PolicyValueDataset(states, policies, values)
-    dataset_size = len(states)
-    
-    def objective(trial):
-        """Optuna objective function"""
-        
-        # Hyperparameter suggestions
-        hidden_dim = trial.suggest_categorical('hidden_dim', [128, 160, 192, 224, 256, 288])
-        N = trial.suggest_int('N', 2, 10)
-        T = trial.suggest_int('T', 2, 10)
-        
-        # Learning rate és batch size ÖSSZEFÜGGŐ optimalizálás
-        # Kisebb batch → kisebb lr (stabilabb gradiens, de lassabb konvergencia)
-        # Nagyobb batch → nagyobb lr (gyorsabb konvergencia, stabil nagy batch gradiens)
-        batch_size = trial.suggest_categorical('batch_size', [16, 24, 32])
-        
-        # LR scaling based on batch size - empirikus batch size scaling
-        lr_base = trial.suggest_float('lr_base', 8e-5, 3e-4, log=True)
-        
-        if batch_size == 16:
-            lr = lr_base * 0.75  # 25% csökkentés kis batch-hez
-        elif batch_size == 24:
-            lr = lr_base  # Referencia lr (baseline)
-        else:  # batch_size == 32
-            lr = lr_base * 1.3  # 30% növelés nagy batch-hez (sqrt scaling közelítés)
-        
-        # Model létrehozása
-        model = HRMChess(
-            input_dim=72,
-            hidden_dim=hidden_dim,
-            N=N,
-            T=T
-        ).to(device)
-        
-        total_params = sum(p.numel() for p in model.parameters())
-        hrm_steps = N * T
-        
-        # Quick evaluation with early stopping
-        try:
-            # Mini training - csak 2 epoch gyors teszteléshez
-            val_loss = quick_train_eval(
-                model, dataset, 
-                epochs=2, 
-                batch_size=batch_size, 
-                lr=lr,
-                subset_ratio=0.1,  # Csak 10% adaton tesztel a gyorsaságért
-                device=device
-            )
-            
-            # Penalty for too many parameters (efficiency optimization)
-            param_penalty = total_params / 1_000_000  # 1M param = 1.0 penalty
-            steps_penalty = max(0, hrm_steps - 10) * 0.1  # 10+ lépés penalty
-            
-            # Combined objective: validation loss + efficiency penalties
-            objective_value = val_loss + param_penalty * 0.01 + steps_penalty * 0.02
-            
-            # Prune trial ha túl rossz
-            if val_loss > 10.0:  # Prune clearly bad trials
-                raise optuna.TrialPruned()
-            
-            return objective_value
-            
-        except Exception as e:
-            print(f"Trial failed: {e}")
-            return float('inf')
-    
-    # Optuna study létrehozása
-    sampler = TPESampler(seed=42)  # Reproducible results
-    study = optuna.create_study(
-        direction='minimize', 
-        sampler=sampler,
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5)
-    )
-    
-    # Optimization futtatása
-    print(f"🔬 Starting {n_trials} Optuna trials...")
-    study.optimize(objective, n_trials=n_trials, timeout=1800)  # Max 30 min
-    
-    # Legjobb eredmények
-    print(f"\n🏆 OPTUNA OPTIMIZATION RESULTS")
-    print("="*50)
-    
-    best_trial = study.best_trial
-    best_params = best_trial.params
-    
-    print(f"Best trial value: {best_trial.value:.4f}")
-    print(f"Best parameters:")
-    for key, value in best_params.items():
-        print(f"  {key}: {value}")
-    
-    # Top 5 trial eredmények
-    print(f"\n📊 Top 5 trials:")
-    sorted_trials = sorted(study.trials, key=lambda t: t.value if t.value is not None else float('inf'))
-    for i, trial in enumerate(sorted_trials[:5]):
-        if trial.value is not None:
-            print(f"{i+1}. Value: {trial.value:.4f}, Params: {trial.params}")
-    
-    # Visszatérés optimális konfigurációval
-    # Helyes lr kiszámítása lr_base és batch_size alapján
-    lr_base = best_params['lr_base']
-    batch_size = best_params['batch_size']
-    
-    if batch_size == 16:
-        lr = lr_base * 0.75
-    elif batch_size == 24:
-        lr = lr_base
-    else:  # batch_size == 32
-        lr = lr_base * 1.3
-    
-    best_config = {
-        'hidden_dim': best_params['hidden_dim'],
-        'N': best_params['N'],
-        'T': best_params['T'],
-        'lr': lr,  # Számított lr érték
-        'lr_base': lr_base,  # Eredeti lr_base is megőrzése
-        'batch_size': batch_size,
-        'name': f"Optuna-Optimized-{best_params['N']}x{best_params['T']}-BS{batch_size}"
-    }
-    
-    return best_config
-
-def get_user_choice():
-    """Interactive parameter selection"""
-    print("\n" + "="*60)
-    print("� HRM CHESS MODEL CONFIGURATION")
-    print("="*60)
-    print("Choose your training approach:")
-    print("1. 🔧 Hyperparameter Optimization (Automatic - finds best N, T, hidden_dim)")
-    print("2. ⚙️  Manual Parameter Settings (Choose your own N, T, hidden_dim)")
-    
-    while True:
-        try:
-            choice = input("\nEnter your choice (1-2): ").strip()
-            if choice in ['1', '2']:
-                return int(choice)
-            else:
-                print("❌ Please enter 1 or 2")
-        except (ValueError, KeyboardInterrupt):
-            print("\n❌ Invalid input. Please enter 1 or 2")
-
 def get_manual_parameters():
     """Get manual hyperparameters from user"""
     print("\n🔧 MANUAL PARAMETER CONFIGURATION")
@@ -710,6 +559,7 @@ def get_manual_parameters():
         return get_manual_parameters()
     
     return hidden_dim, N, T
+
 
 class StockfishEvaluator:
     """Stockfish motor integráció pozíció értékeléshez - PERZISZTENS KAPCSOLAT"""
@@ -892,99 +742,35 @@ class StockfishEvaluator:
     def __del__(self):
         """Cleanup when object is destroyed"""
         self.close()
-    
-    def create_policy_value_dataset(self, states, policies, max_positions=10000):
-        """
-        Policy+Value dataset létrehozása Stockfish értékeléssel
-        """
-        print(f"\n🤖 Creating Policy+Value dataset with Stockfish...")
-        print(f"📊 Processing {min(len(states), max_positions):,} positions")
-        
-        # Limit positions for reasonable processing time
-        total_positions = min(len(states), max_positions)
-        
-        stockfish_states = []
-        stockfish_policies = []
-        stockfish_values = []
-        
-        processed = 0
-        start_time = time.time()
-        
-        for i in range(total_positions):
-            if i % 1000 == 0:
-                elapsed = time.time() - start_time
-                rate = i / elapsed if elapsed > 0 else 0
-                eta = (total_positions - i) / rate if rate > 0 else 0
-                print(f"📈 Progress: {i:,}/{total_positions:,} ({i/total_positions*100:.1f}%) "
-                      f"Rate: {rate:.1f}/s ETA: {eta/60:.1f}min")
-            
-            try:
-                # Convert state back to FEN for Stockfish
-                state = states[i]
-                policy = policies[i]
-                
-                # Simple state to FEN conversion (simplified)
-                board = chess.Board()
-                # Note: This is a simplified conversion, a proper implementation
-                # would reconstruct the exact position from the state vector
-                
-                # For now, use a basic starting position and get some evaluation
-                fen = board.fen()
-                
-                # Get Stockfish evaluation
-                best_move, value = self.evaluate_position(fen)
-                
-                if best_move is not None:
-                    stockfish_states.append(state)
-                    stockfish_policies.append(policy)
-                    stockfish_values.append(value)
-                    processed += 1
-                
-            except Exception as e:
-                continue  # Skip problematic positions
-        
-        print(f"\n✅ Created Policy+Value dataset:")
-        print(f"   📊 Processed: {processed:,} positions")
-        print(f"   📈 Success rate: {processed/total_positions*100:.1f}%")
-        
-        return np.array(stockfish_states), stockfish_policies, np.array(stockfish_values)
 
-def create_policy_value_dataset_from_games(max_positions=10000):
+def create_dataset_from_games(max_positions=10000):
     """
-    Policy+Value dataset létrehozása játszmákból és Stockfish értékeléssel
+    Dataset létrehozása játszmákból és Stockfish értékeléssel - egyszerűsített megközelítés
     
     Args:
         max_positions: Maximális pozíciók száma a dataset-ben
     """
-    print("\n🎮 Creating Policy+Value dataset from games...")
+    import math
+    import time
+
+    print("\n🎮 Creating dataset from games with Stockfish evaluation...")
     print(f"🎯 Target positions: {max_positions:,}")
-    
-    # Intelligens PGN games becslés a dataset méret alapján
-    avg_positions_per_game = 22  # Átlagos pozíciók száma játszmánként
-    
-    # PGN target számítás - általános skálázható módszer
-    # Logaritmikus skálázás minden dataset méretre
-    
-    # Logaritmikus skálázás: 50% puzzle kis dataset-nél → 15% nagy dataset-nél
+
+    avg_positions_per_game = 22
     log_factor = math.log10(max(max_positions, 1000))
-    base_ratio = 0.5  # 50% kezdeti puzzle ratio
-    scale_factor = (log_factor - 3.0) / 4.0  # 3=log10(1000), 7=log10(10M)
-    scale_factor = max(0, min(1, scale_factor))  # Clamp 0-1 közé
-    
-    # Puzzle ratio: 50% (1k) → 35% (100k) → 20% (10M) → 15% (100M+)
+    base_ratio = 0.5
+    scale_factor = (log_factor - 3.0) / 4.0
+    scale_factor = max(0, min(1, scale_factor))
     puzzle_ratio = base_ratio - (scale_factor * 0.35)
-    
-    # PGN ratio - komplementer
     pgn_ratio = 1.0 - puzzle_ratio
     pgn_target_positions = int(max_positions * pgn_ratio)
     estimated_games_needed = max(1000, int(pgn_target_positions / avg_positions_per_game))
-    
+
     print(f"🎯 Automatic scaling for {max_positions:,} positions:")
-    print(f"   📊 PGN ratio: {pgn_ratio:.1%} → {pgn_target_positions:,} positions")  
+    print(f"   📊 PGN ratio: {pgn_ratio:.1%} → {pgn_target_positions:,} positions")
     print(f"   🧩 Puzzle ratio: {puzzle_ratio:.1%} → {int(max_positions * puzzle_ratio):,} positions")
     print(f"   🎮 Estimated games needed: {estimated_games_needed:,}")
-    
-    # Load PGN data
+
     print(f"📥 Loading PGN games...")
     try:
         pgn_states, pgn_policies, pgn_fens = load_pgn_data(
@@ -998,72 +784,36 @@ def create_policy_value_dataset_from_games(max_positions=10000):
     except:
         print("⚠️ PGN file not found, using minimal dataset")
         pgn_states, pgn_policies, pgn_fens = [], [], []
-    
-    # Load PUZZLE data - TAKTIKAI KÉPESSÉGEK - SKÁLÁZHATÓ MÉRETEZÉS
+
     print(f"📥 Loading tactical puzzles...")
-    
-    # Általános puzzle ratio számítás - logaritmikus skálázás
-    # Kisebb dataset-eknél több puzzle (jobb taktikai fókusz)
-    # Nagyobb dataset-eknél kevesebb puzzle (PGN dominancia)
-    
-    # Logaritmikus skálázás: 50% puzzle kis dataset-nél → 15% nagy dataset-nél
-    log_factor = math.log10(max(max_positions, 1000))  # min 1000 a log hibák elkerülésére
-    base_ratio = 0.5  # 50% kezdeti puzzle ratio
-    scale_factor = (log_factor - 3.0) / 4.0  # 3=log10(1000), 7=log10(10M) → 0-1 range
-    scale_factor = max(0, min(1, scale_factor))  # Clamp 0-1 közé
-    
-    # Puzzle ratio: 50% (1k) → 35% (100k) → 20% (10M) → 15% (100M+)
-    puzzle_ratio = base_ratio - (scale_factor * 0.35)
     puzzle_target = int(max_positions * puzzle_ratio)
-    
-    print(f"🎯 Dataset size: {max_positions:,} → Puzzle ratio: {puzzle_ratio:.1%}")
-    print(f"🎯 Target puzzle count: {puzzle_target:,}")
-    
-    # PGN ratio kalkuláció
-    pgn_ratio = 1.0 - puzzle_ratio
-    pgn_target_positions = int(max_positions * pgn_ratio)
-    
+
     try:
         puzzle_states, puzzle_policies, puzzle_fens = load_puzzle_data(
             "./lichess_db_puzzle.csv",
             fen_to_tensor,
             max_puzzles=puzzle_target,
-            min_rating=800,   # Alacsonyabb minimum több puzzle-ért
-            max_rating=2500   # Magasabb maximum több puzzle-ért
+            min_rating=800,
+            max_rating=2500
         )
         print(f"✅ Loaded {len(puzzle_states):,} tactical positions from CSV")
     except:
         print("⚠️ Puzzle CSV file not found, using only PGN data")
         puzzle_states, puzzle_policies, puzzle_fens = [], [], []
-    
-    # BALANCED DATASET COMBINATION
+
     print(f"\n🎯 COMBINING PGN + PUZZLE DATA:")
     print(f"   📊 PGN positions: {len(pgn_states):,}")
     print(f"   🧩 Puzzle positions: {len(puzzle_states):,}")
-    
-    # Dataset composition analysis
-    total_loaded = len(pgn_states) + len(puzzle_states)
-    if total_loaded > 0:
-        pgn_percentage = len(pgn_states) / total_loaded * 100
-        puzzle_percentage = len(puzzle_states) / total_loaded * 100
-        print(f"   📈 Composition: {pgn_percentage:.1f}% PGN, {puzzle_percentage:.1f}% Puzzles")
-        
-        if len(puzzle_states) < puzzle_target * 0.5:
-            print(f"   ⚠️ Warning: Only {len(puzzle_states):,} puzzles loaded (target: {puzzle_target:,})")
-            print(f"   💡 Consider checking puzzle CSV file or lowering rating filters")
-    
-    # Combine all data sources
+
     all_states = pgn_states + puzzle_states
-    all_policies = pgn_policies + puzzle_policies
     all_fens = pgn_fens + puzzle_fens
-    
+
     if len(all_states) == 0:
         print("❌ No training data available!")
-        return None, None, None
-    
+        return None, None
+
     print(f"📊 Total positions loaded: {len(all_states):,}")
-    
-    # Dataset adequacy check
+
     adequacy_ratio = len(all_states) / max_positions if max_positions > 0 else 0
     if adequacy_ratio < 0.5:
         print(f"⚠️ Warning: Only {adequacy_ratio*100:.1f}% of target positions loaded!")
@@ -1072,81 +822,63 @@ def create_policy_value_dataset_from_games(max_positions=10000):
         print(f"✅ Excellent: {adequacy_ratio:.1f}x target positions available")
     else:
         print(f"✅ Good: {adequacy_ratio*100:.1f}% of target positions loaded")
-    
-    # Adjust to target max_positions
+
     if len(all_states) > max_positions:
         print(f"🎯 Randomly selecting {max_positions:,} positions from {len(all_states):,} available")
         indices = np.random.choice(len(all_states), max_positions, replace=False)
         all_states = [all_states[i] for i in indices]
-        all_policies = [all_policies[i] for i in indices]
         all_fens = [all_fens[i] for i in indices]
-    
-    # Create Stockfish evaluator for real position evaluation
-    evaluator = StockfishEvaluator()
-    
-    # GYORS STOCKFISH BATCH EVALUATION
-    print("🤖 Fast batch evaluation with persistent Stockfish...")
-    
-    values = []
+
+    print(f"🤖 Starting Stockfish evaluation...")
+    print("📊 Progress updates will appear as positions are evaluated...")
+
     processed_states = []
     processed_policies = []
     
-    # Batch processing with progress tracking
-    batch_size = 1000  # Process in batches for better progress tracking
-    total_batches = (len(all_states) + batch_size - 1) // batch_size
-    
     start_time = time.time()
-    processed_count = 0
+
+    # Use single StockfishEvaluator instance
+    evaluator = StockfishEvaluator()
     
-    for batch_idx in range(total_batches):
-        batch_start = batch_idx * batch_size
-        batch_end = min(batch_start + batch_size, len(all_states))
+    for i, fen in enumerate(all_fens):
+        state = all_states[i]
+        best_move, score = evaluator.evaluate_position(fen)
         
-        # Progress update
-        elapsed = time.time() - start_time
-        rate = processed_count / elapsed if elapsed > 0 else 0
-        eta = (len(all_states) - processed_count) / rate if rate > 0 else 0
-        
-        print(f"📈 Batch {batch_idx+1}/{total_batches} | "
-              f"Progress: {processed_count:,}/{len(all_states):,} ({processed_count/len(all_states)*100:.1f}%) | "
-              f"Rate: {rate:.1f}/s | ETA: {eta/60:.1f}min")
-        
-        # Process batch
-        for i in range(batch_start, batch_end):
-            state = all_states[i]
-            policy = all_policies[i]
-            fen = all_fens[i]
-            
+        # Convert to move_scores format for compatibility
+        if best_move:
             try:
-                # Use persistent Stockfish connection - MUCH FASTER
-                best_move, stockfish_value = evaluator.evaluate_position(fen)
-                
-                if best_move is not None:
-                    value = stockfish_value
-                else:
-                    # Fallback to neutral if Stockfish fails
-                    value = 0.0
-                    
-            except Exception as e:
-                # Fallback value if evaluation fails
-                value = 0.0
-            
-            values.append(value)
-            processed_states.append(state)
-            processed_policies.append(policy)
-            processed_count += 1
+                board = chess.Board(fen)
+                move = chess.Move.from_uci(best_move)
+                move_tuple = (move.from_square, move.to_square)
+                move_scores = [(move_tuple, score)]
+            except:
+                move_scores = []
+        else:
+            move_scores = []
+        
+        processed_states.append(state)
+        processed_policies.append(move_scores)
+        
+        # Progress update every 10 positions
+        if (i + 1) % 10 == 0 or (i + 1) == len(all_fens):
+            elapsed = time.time() - start_time
+            rate = (i + 1) / elapsed if elapsed > 0 else 0
+            eta = (len(all_fens) - (i + 1)) / rate if rate > 0 else 0
+            print(f"📈 Progress: {i + 1}/{len(all_fens):,} positions evaluated | "
+                  f"Rate: {rate:.1f} pos/s | ETA: {eta/60:.1f} min")
     
-    # Close Stockfish engine
     evaluator.close()
+
+    total_moves = sum(len(moves) for moves in processed_policies)
+    elapsed_total = time.time() - start_time
     
-    values = np.array(values)
-    
-    print(f"\n✅ Policy+Value dataset created:")
-    print(f"   📊 Positions: {len(processed_states):,}")
-    print(f"   📈 Value range: [{np.min(values):.3f}, {np.max(values):.3f}]")
-    print(f"   📊 Value mean: {np.mean(values):.3f} ± {np.std(values):.3f}")
-    
-    return processed_states, processed_policies, values
+    print(f"\n✅ Policy dataset created in {elapsed_total/60:.1f} minutes!")
+    print(f"   📊 Positions evaluated: {len(processed_states):,}")
+    print(f"   📊 Total moves evaluated: {total_moves:,}")
+    print(f"   ⚡ Average rate: {len(processed_states)/elapsed_total:.1f} positions/second")
+
+    return processed_states, processed_policies
+
 
 if __name__ == "__main__":
     print("🏗️ HRM CHESS MODEL TRAINING")
@@ -1159,12 +891,12 @@ if __name__ == "__main__":
     # GPU MEMORY DETECTION & OPTIMIZATION
     gpu_config = detect_gpu_memory_and_optimize_training()
     
-    # Load or create Policy+Value dataset
-    pv_dataset_path = "chess_policy_value_dataset.pt"
+    # Load or create dataset
+    dataset_path = "chess_positions_dataset.pt"
     
-    if not os.path.exists(pv_dataset_path):
-        print(f"\n📝 Policy+Value dataset not found: {pv_dataset_path}")
-        print("� Creating new Policy+Value dataset...")
+    if not os.path.exists(dataset_path):
+        print(f"\n📝 Dataset not found: {dataset_path}")
+        print("📊 Creating new dataset...")
         
         # Ask user for dataset size
         while True:
@@ -1180,20 +912,17 @@ if __name__ == "__main__":
         print(f"🎯 Creating dataset with {max_positions:,} positions")
         
         # Create dataset from games and puzzles with user-specified size
-        states, policies, values = create_policy_value_dataset_from_games(
-            max_positions=max_positions   # User-specified dataset size
-        )
+        states, policies = create_dataset_from_games(max_positions)
         
         if states is None:
             print("❌ Failed to create dataset!")
             exit(1)
         
         # Save dataset
-        print("💾 Saving Policy+Value dataset...")
+        print("💾 Saving dataset...")
         dataset_info = {
             'states': np.array(states, dtype=np.float32),
             'policies': policies,
-            'values': values,
             'info': {
                 'created': time.time(),
                 'source': 'PGN + Tactical Puzzles (Stockfish evaluation)',
@@ -1206,35 +935,30 @@ if __name__ == "__main__":
             }
         }
         
-        torch.save(dataset_info, pv_dataset_path)
-        print(f"✅ Dataset saved to: {pv_dataset_path}")
+        torch.save(dataset_info, dataset_path)
+        print(f"✅ Dataset saved to: {dataset_path}")
         
         # Use the created data
         data = dataset_info
     else:
-        # Load existing Policy+Value dataset
-        print(f"\n📥 Loading existing Policy+Value dataset: {pv_dataset_path}")
-        data = torch.load(pv_dataset_path, weights_only=False)
+        # Load existing dataset
+        print(f"\n📥 Loading existing dataset: {dataset_path}")
+        data = torch.load(dataset_path, weights_only=False)
     
     states = data['states']
     policies = data['policies']
-    values = data['values']
     info = data['info']
     
-    print(f"✅ Loaded Policy+Value dataset:")
+    print(f"✅ Loaded dataset:")
     print(f"   📊 Positions: {len(states):,}")
-    print(f"   📈 Value range: [{np.min(values):.3f}, {np.max(values):.3f}]")
-    print(f"   📊 Value mean: {np.mean(values):.3f} ± {np.std(values):.3f}")
     print(f"   🤖 Source: {info.get('source', 'Unknown')}")
     print(f"   🎮 Data mix: {info.get('data_mix', 'Unknown composition')}")
     print(f"   🖥️ GPU Optimized: {info.get('gpu_optimized', False)}")
     
-    # Policy+Value training mode
-    print("\n🎯 POLICY+VALUE TRAINING MODE")
+    # training mode
+    print("\n🎯 TRAINING MODE")
     print("   • Input: 72-dim vector → 8x8 2D conv + extra features")
     print("   • Policy Head: 64x64 move matrix")
-    print("   • Value Head: Position evaluation [-1, 1]")
-    print("   • Training: Stockfish supervision")
     print("   • Dataset: Balanced PGN games + tactical puzzles")
     
     print("\n⚙️ HRM PARAMETER EXPLANATION:")
@@ -1245,87 +969,25 @@ if __name__ == "__main__":
     print("   • Optimal balance: complexity vs speed vs accuracy")
     
     # Configuration
-    data_path = pv_dataset_path
-    model_path = "hrm_policy_value_chess_model.pt"
+    data_path = dataset_path
+    model_path = "hrm_chess_model.pt"
     
     # Get dataset info
     dataset_size = len(states)
     print(f"\n📊 Dataset size: {dataset_size:,} positions")
     
-    # Interactive parameter selection
-    user_choice = get_user_choice()
+    # MANUAL PARAMETERS
+    hidden_dim, N, T = get_manual_parameters()
     
-    if user_choice == 1:
-        # HYPERPARAMETER OPTIMIZATION MODE
-        print("\n🔬 HYPERPARAMETER OPTIMIZATION MODE ENABLED")
-        
-        # Optuna hyperparameter optimization
-        try:
-            import optuna
-            print("✅ Optuna available - using advanced Bayesian optimization")
-            best_config = optuna_hyperparameter_optimization(states, policies, values, n_trials=15)
-        except ImportError:
-            print("❌ Optuna not installed - please install with: pip install optuna")
-            print("� Falling back to manual configuration...")
-            hidden_dim, N, T = get_manual_parameters()
-            lr = 2e-4
-            batch_size = 32
-            best_config = None
-        
-        if best_config:
-            hidden_dim = best_config['hidden_dim']
-            N = best_config['N']
-            T = best_config['T']
-            
-            # GPU-optimized batch size és learning rate
-            gpu_batch_size = gpu_config['batch_size']
-            gpu_lr_multiplier = gpu_config['lr_multiplier']
-            
-            # SMART GPU SCALING: Use Optuna as baseline, scale up with GPU power
-            if 'batch_size' in best_config:
-                optuna_batch = best_config['batch_size']
-                # GPU scaling: if GPU can handle more, use more!
-                batch_size = max(optuna_batch, min(gpu_batch_size, optuna_batch * 2))  # Cap at 2x Optuna or GPU limit
-                print(f"🔧 Batch size: Optuna suggested {optuna_batch}, GPU scaled to {batch_size} (limit: {gpu_batch_size})")
-            else:
-                batch_size = gpu_batch_size
-                
-            # Adjust learning rate for final batch size (not just GPU multiplier)
-            if 'lr' in best_config:
-                base_lr = best_config['lr']
-            else:
-                base_lr = 2e-4
-                
-            # Scale LR for both GPU power and actual batch size used
-            batch_scaling = batch_size / best_config.get('batch_size', 16)  # Scale from Optuna baseline
-            lr = base_lr * gpu_lr_multiplier * batch_scaling  # Both GPU and batch scaling
-                
-            model_size = f"GPU_OPTIMIZED-{best_config['name']}"
-            print(f"\n✅ Using GPU-optimized configuration:")
-            print(f"   🎯 Final LR: {lr:.6f} (base: {base_lr:.6f} × GPU: {gpu_lr_multiplier:.2f} × batch: {batch_scaling:.2f})")
-            print(f"   📊 Final Batch: {batch_size} (GPU-enhanced from {best_config.get('batch_size', 16)})")
-            print(f"   🖥️ GPU Level: {gpu_config['optimization_level']}")
-            print(f"   🖥️ VRAM: {gpu_config['memory_gb']:.1f} GB ({gpu_config['device_name']})")
-        else:
-            print("⚠️ Hyperopt failed, using GPU-optimized defaults")
-            hidden_dim, N, T = 192, 3, 4
-            batch_size = gpu_config['batch_size']
-            lr = 2e-4 * gpu_config['lr_multiplier']
-            model_size = f"GPU_DEFAULT-{gpu_config['optimization_level']}"
-            
-    elif user_choice == 2:
-        # MANUAL PARAMETER MODE with GPU optimization
-        hidden_dim, N, T = get_manual_parameters()
-        
-        # Apply GPU optimizations
-        batch_size = gpu_config['batch_size']
-        lr = 2e-4 * gpu_config['lr_multiplier']
-        model_size = f"GPU_MANUAL-{N}x{T}-{gpu_config['optimization_level']}"
-        
-        print(f"\n🔧 GPU OPTIMIZATIONS APPLIED:")
-        print(f"   📊 Batch Size: {batch_size} (GPU-optimized)")
-        print(f"   📈 Learning Rate: {lr:.6f} (base: 2e-4 × {gpu_config['lr_multiplier']:.2f})")
-        print(f"   🖥️ GPU Level: {gpu_config['optimization_level']}")
+    # Apply GPU optimizations
+    batch_size = gpu_config['batch_size']
+    lr = 2e-4 * gpu_config['lr_multiplier']
+    model_size = f"GPU_MANUAL-{N}x{T}-{gpu_config['optimization_level']}"
+    
+    print("\n🔧 GPU OPTIMIZATIONS APPLIED:")
+    print(f"   📊 Batch Size: {batch_size} (GPU-optimized)")
+    print(f"   📈 Learning Rate: {lr:.6f} (base: 2e-4 × {gpu_config['lr_multiplier']:.2f})")
+    print(f"   🖥️ GPU Level: {gpu_config['optimization_level']}")
     
     # HRM modell létrehozása optimalizált paraméterekkel
     model = HRMChess(input_dim=72, hidden_dim=hidden_dim, N=N, T=T).to(device)
@@ -1335,7 +997,7 @@ if __name__ == "__main__":
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     hrm_steps = N * T
     
-    print(f"\n🏗️ MODEL ARCHITECTURE:")
+    print("\n🏗️ MODEL ARCHITECTURE:")
     print(f"📊 Total parameters: {total_params:,}")
     print(f"📊 Trainable parameters: {trainable_params:,}")
     print(f"🔄 HRM reasoning steps: {hrm_steps} (N={N} × T={T})")
@@ -1346,17 +1008,15 @@ if __name__ == "__main__":
     print("   • Board enhancer: hidden_dim → hidden_dim → hidden_dim")
     print(f"   • HRM modules: L_net and H_net with N={N}, T={T}")
     print("   • Policy Head: Move prediction (hidden_dim → 64*64)")
-    print("   • Value Head: Position evaluation (hidden_dim → 1)")
     
     # GPU-optimized training configuration
     epochs = 30  # Több epoch a jobb konvergenciáért
     
-    print(f"\n⚙️ GPU-OPTIMIZED TRAINING CONFIGURATION:")
+    print("\n⚙️ GPU-OPTIMIZED TRAINING CONFIGURATION:")
     print(f"   • Model: {model_size}")
-    print(f"   • Mode: Policy+Value+Warmup")
     print(f"   • Batch size: {batch_size} (GPU-optimized)")
     print(f"   • Learning rate: {lr:.6f} (GPU-scaled)")
-    print(f"   • Warmup epochs: 3 (linear warmup + cosine annealing)")
+    print("   • Warmup epochs: 3 (linear warmup + cosine annealing)")
     print(f"   • Total epochs: {epochs}")
     print(f"   • HRM steps: {N}×{T}={N*T}")
     print(f"   • Parameters: {total_params:,}")
@@ -1368,10 +1028,10 @@ if __name__ == "__main__":
     estimated_memory_per_batch = (batch_size * 72 * 4 + batch_size * 64 * 64 * 4) / (1024**3)  # Rough estimate in GB
     print(f"   📊 Estimated memory/batch: ~{estimated_memory_per_batch:.2f} GB")
     
-    # Create Policy+Value dataset
-    dataset = PolicyValueDataset(states, policies, values)
-    print(f"\n📊 Policy+Value dataset: {len(dataset):,} positions")
-    print("🚀 Starting GPU-optimized Policy+Value HRM training with warmup...")
+    # Create Policy dataset
+    dataset = PolicyDataset(states, policies)
+    print(f"\n📊 Dataset: {len(dataset):,} positions")
+    print("🚀 Starting GPU-optimized HRM training with warmup...")
     
     # Train with GPU-optimized parameters and warmup
     train_loop(model, dataset, epochs=epochs, batch_size=batch_size, lr=lr, warmup_epochs=3, device=device)
@@ -1401,10 +1061,9 @@ if __name__ == "__main__":
     print("\n✅ Training completed!")
     print(f"💾 Model saved to: {model_path}")
     print(f"🏆 HRM (N={N}, T={T}, hidden_dim={hidden_dim}) with {total_params:,} parameters")
-    print(f"📊 Trained on {len(dataset):,} positions with Policy+Value+Warmup mode")
+    print(f"📊 Trained on {len(dataset):,} positions with Warmup mode")
     print(f"🎮 Dataset: Balanced PGN games + tactical puzzles for enhanced gameplay")
     print(f"🔥 Warmup: 3 epochs with linear warmup + cosine annealing")
     
     print("🎯 Expected: Enhanced move prediction + position evaluation + tactical strength")
     print("⚔️ Ready for tactical fine-tuning and stronger gameplay!")
-

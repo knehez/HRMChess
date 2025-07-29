@@ -205,24 +205,16 @@ class ELORatingSystem:
         return hidden_dim, N, T
         
     def model_move(self, board, temperature=0.7, top_k=5, debug=False):
-        """Továbbfejlesztett modell lépés választás erősebb játékért - Policy+Value támogatással"""
+        """Továbbfejlesztett modell lépés választás erősebb játékért"""
         state = fen_to_tensor(board.fen())
         state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
-            # HRM move prediction - handle both Policy-only and Policy+Value models
-            model_output = self.model(state_tensor, return_value=True)
+            # HRM move prediction - Policy-only model
+            move_logits = self.model(state_tensor)
             
-            if isinstance(model_output, tuple):
-                # Policy+Value model: (move_logits, values)
-                move_logits, values = model_output
-                position_value = values.item()
-                if debug:
-                    print(f"  Position value: {position_value:.3f}")
-            else:
-                # Legacy Policy-only model
-                move_logits = model_output
-                position_value = None
+            # No value output from current HRM model
+            position_value = None
             
             policy_probs = torch.softmax(move_logits.view(-1) / temperature, dim=0)  # Temperature scaling
         
@@ -656,19 +648,34 @@ def main():
         except FileNotFoundError:
             return
     
-    # Stockfish path
-    stockfish_paths = [
-        "stockfish.exe",  # Local directory
-        "C:\\stockfish\\stockfish.exe",  # Windows default
-        "/usr/local/bin/stockfish",  # macOS/Linux
-        "/usr/bin/stockfish"  # Linux package
-    ]
+    # Cross-platform Stockfish path detection
+    def find_stockfish_path():
+        """Auto-detect Stockfish path for different operating systems"""
+        if os.name == 'nt':  # Windows
+            candidates = [
+                "stockfish.exe",
+                "./stockfish.exe",
+                "C:/stockfish/stockfish.exe",
+                "C:/Program Files/stockfish/stockfish.exe"
+            ]
+        else:  # Linux/Unix
+            candidates = [
+                "/usr/bin/stockfish",
+                "/usr/local/bin/stockfish", 
+                "./stockfish",
+                "stockfish",
+                "/opt/stockfish/stockfish",
+                "/usr/games/stockfish"
+            ]
+        
+        for path in candidates:
+            if os.path.exists(path):
+                print(f"✅ Found Stockfish at: {path}")
+                return path
+        
+        return None
     
-    stockfish_path = None
-    for path in stockfish_paths:
-        if os.path.exists(path):
-            stockfish_path = path
-            break
+    stockfish_path = find_stockfish_path()
     
     if not stockfish_path:
         print("⚠️ Stockfish not found. Download from: https://stockfishchess.org/download/")

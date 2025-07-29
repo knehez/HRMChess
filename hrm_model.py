@@ -1,6 +1,6 @@
 """
 HRM Chess Model - Hierarchical Reasoning Machine for Chess
-Konvolúciós HRM implementáció Policy+Value head-del
+Konvolúciós HRM implementáció
 """
 
 import torch
@@ -9,24 +9,50 @@ import torch.nn.functional as F
 import math
 
 
-class PolicyValueDataset(torch.utils.data.Dataset):
-    """Dataset Policy + Value adatokhoz"""
+class PolicyDataset(torch.utils.data.Dataset):
+    """Dataset Policy adatokhoz - Fixed for Stockfish evaluation data"""
     
-    def __init__(self, states, policies, values):
+    def __init__(self, states, policies):
         """
         Args:
             states: Board states (tensors)
-            policies: Move policies (from_square, to_square)
-            values: Position values [-1, 1]
+            policies: List of move evaluations from Stockfish [(move_tuple, score), ...]
         """
         self.states = torch.FloatTensor(states)
-        self.values = torch.FloatTensor(values).unsqueeze(1)  # (N, 1)
         
-        # Convert policies to one-hot matrix
+        # Convert Stockfish evaluations to probability distributions
         policy_matrices = []
-        for from_sq, to_sq in policies:
+        for moves in policies:
             policy_matrix = torch.zeros(64, 64)
-            policy_matrix[from_sq, to_sq] = 1.0
+            
+            if len(moves) > 0:
+                # Extract scores and convert to probabilities
+                move_tuples = []
+                scores = []
+                
+                for move_tuple, score in moves:
+                    move_tuples.append(move_tuple)
+                    # Convert Stockfish score to positive value (higher = better)
+                    # Stockfish scores are from model's perspective, so negate them
+                    scores.append(-score)  # Negate because we want higher scores for better moves
+                
+                # Convert scores to probabilities using softmax with temperature
+                if len(scores) > 0:
+                    scores_tensor = torch.tensor(scores, dtype=torch.float32)
+                    # Use temperature to control sharpness (lower = more focused)
+                    temperature = 2.0
+                    probabilities = torch.softmax(scores_tensor / temperature, dim=0)
+                    
+                    # Assign probabilities to policy matrix
+                    for (from_sq, to_sq), prob in zip(move_tuples, probabilities):
+                        if 0 <= from_sq < 64 and 0 <= to_sq < 64:
+                            policy_matrix[from_sq, to_sq] = prob.item()
+            
+            # If no moves or all zero, create uniform distribution over legal moves
+            if policy_matrix.sum() == 0:
+                # This shouldn't happen with proper Stockfish data, but safety fallback
+                policy_matrix.fill_(1.0 / (64 * 64))
+            
             policy_matrices.append(policy_matrix)
         
         self.policies = torch.stack(policy_matrices)
@@ -35,7 +61,7 @@ class PolicyValueDataset(torch.utils.data.Dataset):
         return len(self.states)
     
     def __getitem__(self, idx):
-        return self.states[idx], self.policies[idx], self.values[idx]
+        return self.states[idx], self.policies[idx]
 
 
 class HRMChess(nn.Module):
@@ -99,34 +125,26 @@ class HRMChess(nn.Module):
         )
         
         # Policy head - move prediction
-        self.policy_head = nn.Linear(hidden_dim, 64*64)
-        
-        # Value head - position evaluation
-        self.value_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim//2),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim//2, hidden_dim//4),
-            nn.ReLU(),
-            nn.Linear(hidden_dim//4, 1),
-            nn.Tanh()  # Output [-1, 1]
+        self.policy_head = nn.Sequential(
+            nn.Linear(hidden_dim, 64*64),
+            nn.Tanh()
         )
+        
+        # Value head eltávolítva
     
-    def forward(self, x, z_init=None, return_value=True):
+    def forward(self, x, z_init=None):
         """
-        Konvolúciós HRM implementation Policy+Value head-del:
+        Konvolúciós HRM implementation head-del:
         - Input: 72 dimenziós vektor (64 mező + 8 extra info)
         - 2D Konvolúció a sakktábla reprezentációhoz
-        - Output: Policy (64x64) és opcionálisan Value (1)
+        - Output: Policy (64x64)
         
         Args:
             x: Input tensor (batch, 72)
             z_init: Initial HRM states (optional)
-            return_value: Ha True, visszaadja a value predikciót is
             
         Returns:
             move_logits: (batch, 64, 64) policy matrix
-            values: (batch, 1) position values (ha return_value=True)
         """
         batch_size = x.size(0)
         device = x.device
@@ -180,18 +198,12 @@ class HRMChess(nn.Module):
         
         # Policy prediction from z_H
         move_logits = self.policy_head(z_H).view(batch_size, 64, 64)
-        
-        if return_value:
-            # Value prediction from z_H
-            values = self.value_head(z_H)  # (batch, 1)
-            return move_logits, values
-        else:
-            return move_logits
+        return move_logits
 
 
-def train_step(model, batch, optimizer, temperature=1.0, n_supervision=1, policy_weight=1.0, value_weight=0.5):
+def train_step(model, batch, optimizer, temperature=1.0, n_supervision=1):
     """
-    HRM training step Policy+Value támogatással:
+    HRM training step támogatással:
     - Policy loss: Cross entropy
     - Value loss: MSE (opcionális)
     - Combined loss weighting
@@ -205,14 +217,8 @@ def train_step(model, batch, optimizer, temperature=1.0, n_supervision=1, policy
         policy_weight: Policy loss weight
         value_weight: Value loss weight (0 = csak policy)
     """
-    # Check if we have value targets
-    has_value_targets = len(batch) == 3
-    
-    if has_value_targets:
-        x, pi_star, v_star = batch
-    else:
-        x, pi_star = batch
-        v_star = None
+    # Policy only training
+    x, pi_star = batch[:2]
     
     optimizer.zero_grad()
     
@@ -223,68 +229,33 @@ def train_step(model, batch, optimizer, temperature=1.0, n_supervision=1, policy
     z_L = torch.zeros(batch_size, model.hidden_dim, device=device)
     z_state = (z_H, z_L)
     
-    total_loss = 0.0
-    policy_loss_total = 0.0
-    value_loss_total = 0.0
-    
+    policy_losses = []
     # Deep Supervision: multiple steps
     for step in range(n_supervision):
-        # Forward pass - get both policy and value if available
-        if has_value_targets:
-            move_logits, values = model(x, z_state, return_value=True)
-        else:
-            move_logits = model(x, z_state, return_value=False)
-        
-        # Progressively lower temperature for sharper predictions
+        move_logits = model(x, z_state)
         effective_temp = temperature * (0.8 ** step)
-        
-        # Policy loss: cross entropy with label smoothing
         target_probs = pi_star.view(batch_size, -1)
-        
-        # Label smoothing for better generalization - ULTRA CSÖKKENTETT
         smoothed_targets = target_probs * 0.995 + 0.005 / target_probs.size(1)
-        
         move_log_probs = F.log_softmax(move_logits.view(batch_size, -1) / effective_temp, dim=1)
         policy_loss = -torch.sum(smoothed_targets * move_log_probs) / batch_size
-        
-        # Combined loss
-        step_loss = policy_weight * policy_loss
-        policy_loss_total += policy_loss.item()
-        
-        # Value loss (if targets available)
-        if has_value_targets and value_weight > 0:
-            value_loss = F.mse_loss(values, v_star)
-            step_loss += value_weight * value_loss
-            value_loss_total += value_loss.item()
-        
-        total_loss += step_loss.item()
-        
-        # Detach z state for next supervision step
+        policy_losses.append(policy_loss)
         if step < n_supervision - 1:
             with torch.no_grad():
-                _ = model(x, z_state, return_value=False)
+                _ = model(x, z_state)
                 z_state = (torch.zeros_like(z_H), torch.zeros_like(z_L))
-        
-        step_loss.backward()
+        policy_loss.backward()
     
     # Gradient clipping
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
-    
     # Return loss info
-    loss_info = {
-        'total_loss': total_loss / n_supervision,
-        'policy_loss': policy_loss_total / n_supervision,
-        'has_value': has_value_targets
+    avg_policy_loss = sum(policy_losses) / n_supervision
+    return {
+        'total_loss': avg_policy_loss.item()
     }
-    
-    if has_value_targets and value_weight > 0:
-        loss_info['value_loss'] = value_loss_total / n_supervision
-    
-    return loss_info
 
 
-def train_loop(model, dataset, epochs=25, batch_size=16, lr=2e-4, policy_weight=1.0, value_weight=0.5, warmup_epochs=3, device=None):
+def train_loop(model, dataset, epochs=25, batch_size=16, lr=2e-4, warmup_epochs=3, device=None):
     """
     Training loop for HRM model with learning rate warmup
     
@@ -296,12 +267,11 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=2e-4, policy_weight=
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     print(f"\n🏗️ TRAINING LOOP")
-    print(f"   ⚖️ Policy weight: {policy_weight}")
-    print(f"   ⚖️ Value weight: {value_weight}")
+    print(f"   ⚖️ Policy only training (value head removed)")
     print(f"   🔥 Warmup epochs: {warmup_epochs}")
     
     # Train/validation split
-    train_size = int(0.85 * len(dataset))  # Nagyobb training set policy+value-hoz
+    train_size = int(0.85 * len(dataset))  # Nagyobb training set
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
     
@@ -346,28 +316,22 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=2e-4, policy_weight=
     for epoch in range(epochs):
         # Training phase
         model.train()
-        train_losses = {'total': 0, 'policy': 0, 'value': 0}
+        train_losses = {'total': 0, 'policy': 0}
         train_batches = 0
         epoch_start_lr = optimizer.param_groups[0]['lr']
         
         for i, batch in enumerate(train_dataloader):
             batch = tuple(b.to(device) for b in batch)
             
-            # Policy+Value training step
+            # Policy only training step
             loss_info = train_step(
                 model, batch, optimizer,
                 temperature=0.9,
-                n_supervision=1,
-                policy_weight=policy_weight,
-                value_weight=value_weight
+                n_supervision=1
             )
-            
             train_losses['total'] += loss_info['total_loss']
-            train_losses['policy'] += loss_info['policy_loss']
-            if 'value_loss' in loss_info:
-                train_losses['value'] += loss_info['value_loss']
             train_batches += 1
-            
+                
             # Update learning rate scheduler (step-based for warmup)
             scheduler.step()
             global_step += 1
@@ -376,48 +340,29 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=2e-4, policy_weight=
             if i % 1000 == 0 and i > 0:
                 current_lr = optimizer.param_groups[0]['lr']
                 warmup_progress = min(1.0, global_step / warmup_steps) * 100
-                print(f"Epoch {epoch}, Step {i}, Total: {loss_info['total_loss']:.4f}, "
-                      f"Policy: {loss_info['policy_loss']:.4f}, "
-                      f"Value: {loss_info.get('value_loss', 0):.4f}, "
-                      f"LR: {current_lr:.2e}, Warmup: {warmup_progress:.1f}%")
+                print(f"Epoch {epoch}, Step {i}, Total loss: {loss_info['total_loss']:.4f}, "
+                        f"Value loss: {loss_info.get('value_loss', 0):.4f}, "
+                        f"LR: {current_lr:.2e}, Warmup: {warmup_progress:.1f}%")
         
         # Validation phase
         model.eval()
-        val_losses = {'total': 0, 'policy': 0, 'value': 0}
+        val_losses = {'total': 0, 'policy': 0}
         val_batches = 0
-        
         with torch.no_grad():
             for batch in val_dataloader:
                 batch = tuple(b.to(device) for b in batch)
-                x, pi_star, v_star = batch
-                
-                move_logits, values = model(x, return_value=True)
-                
-                # Policy loss
+                x, pi_star, *_ = batch  # ignore value targets if present
+                move_logits = model(x)
                 batch_size = x.size(0)
                 target_probs = pi_star.view(batch_size, -1)
                 move_log_probs = F.log_softmax(move_logits.view(batch_size, -1), dim=1)
-                policy_loss = -torch.sum(target_probs * move_log_probs) / batch_size
-                
-                # Value loss
-                value_loss = F.mse_loss(values, v_star)
-                
-                # Combined loss
-                total_loss = policy_weight * policy_loss + value_weight * value_loss
-                
+                total_loss = -torch.sum(target_probs * move_log_probs) / batch_size
                 val_losses['total'] += total_loss.item()
-                val_losses['policy'] += policy_loss.item()
-                val_losses['value'] += value_loss.item()
                 val_batches += 1
         
         # Average losses
         avg_train_total = train_losses['total'] / train_batches
-        avg_train_policy = train_losses['policy'] / train_batches
-        avg_train_value = train_losses['value'] / train_batches
-        
         avg_val_total = val_losses['total'] / val_batches
-        avg_val_policy = val_losses['policy'] / val_batches
-        avg_val_value = val_losses['value'] / val_batches
         
         current_lr = optimizer.param_groups[0]['lr']
         epoch_end_lr = current_lr
@@ -427,8 +372,8 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=2e-4, policy_weight=
         warmup_progress = min(1.0, global_step / warmup_steps) * 100
         
         print(f"📊 Epoch {epoch:2d}/{epochs} {warmup_status} | "
-              f"Train: {avg_train_total:.4f}(P:{avg_train_policy:.4f}+V:{avg_train_value:.4f}) | "
-              f"Val: {avg_val_total:.4f}(P:{avg_val_policy:.4f}+V:{avg_val_value:.4f}) | "
+              f"Train loss: {avg_train_total:.4f} | "
+              f"Val loss: {avg_val_total:.4f} | "
               f"LR: {epoch_start_lr:.2e}→{epoch_end_lr:.2e}")
         
         if epoch < warmup_epochs:
@@ -458,23 +403,21 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=2e-4, policy_weight=
                     'train_loss': avg_train_total,
                     'val_loss': avg_val_total,
                     'lr': current_lr,
-                    'policy_weight': policy_weight,
-                    'value_weight': value_weight,
-                    'model_type': 'HRM_Policy_Value_Warmup',
+                    'model_type': 'HRM',
                     'warmup_epochs': warmup_epochs,
                     'global_step': global_step
                 }
             }
-            torch.save(checkpoint, "best_hrm_policy_value_chess_model.pt")
-            print(f"✅ Best Policy+Value model saved! (Val loss: {avg_val_total:.4f})")
+            torch.save(checkpoint, "best_hrm_chess_model.pt")
+            print(f"✅ Best model saved! (Val loss: {avg_val_total:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= max_patience:
                 print(f"⏹️ Early stopping at epoch {epoch} (patience exhausted)")
                 break
     
-    print(f"\n🎉 Policy+Value training with warmup completed!")
-    print(f"📁 Best model: best_hrm_policy_value_chess_model.pt")
+    print("\n🎉 Training with warmup completed!")
+    print("📁 Best model: best_hrm_chess_model.pt")
     print(f"📊 Best validation loss: {best_val_loss:.4f}")
     print(f"🔥 Total training steps: {global_step:,}")
     print(f"🔥 Warmup completed: {min(global_step, warmup_steps):,}/{warmup_steps:,} steps")
@@ -512,41 +455,23 @@ def quick_train_eval(model, dataset, epochs=2, batch_size=32, lr=2e-4, subset_ra
     for epoch in range(epochs):
         for batch in train_loader:
             batch = tuple(b.to(device) if hasattr(b, 'to') else b for b in batch)
-            loss = train_step(model, batch, optimizer, temperature=1.0, n_supervision=1)
-    
+            train_step(model, batch, optimizer, temperature=1.0, n_supervision=1)
+
     # Quick validation
     model.eval()
     total_loss = 0.0
     total_batches = 0
-    
+
     with torch.no_grad():
         for batch in val_loader:
             batch = tuple(b.to(device) for b in batch)
-            
-            # Check if we have policy+value data (3 elements) or just policy data (2 elements)
-            if len(batch) == 3:
-                x, pi_star, v_star = batch
-                move_logits, values = model(x, return_value=True)
-                
-                # Policy loss
-                batch_size = x.size(0)
-                target_probs = pi_star.view(batch_size, -1)
-                move_log_probs = F.log_softmax(move_logits.view(batch_size, -1), dim=1)
-                policy_loss = -torch.sum(target_probs * move_log_probs) / batch_size
-                
-                # Value loss
-                value_loss = F.mse_loss(values, v_star)
-                
-                # Combined loss
-                loss = policy_loss + 0.5 * value_loss
-            else:
-                x, pi_star = batch
-                move_logits = model(x, return_value=False)
-                target_probs = pi_star.view(x.size(0), -1)
-                move_log_probs = F.log_softmax(move_logits.view(x.size(0), -1), dim=1)
-                loss = -torch.sum(target_probs * move_log_probs) / x.size(0)
-            
-            total_loss += loss.item()
+            x, pi_star = batch[:2]
+            move_logits = model(x)
+            batch_size = x.size(0)
+            target_probs = pi_star.view(batch_size, -1)
+            move_log_probs = F.log_softmax(move_logits.view(batch_size, -1), dim=1)
+            policy_loss = -torch.sum(target_probs * move_log_probs) / batch_size
+            total_loss += policy_loss.item()
             total_batches += 1
-    
+
     return total_loss / total_batches if total_batches > 0 else float('inf')
