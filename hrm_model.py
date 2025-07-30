@@ -7,34 +7,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from tqdm import tqdm
 
 
 class PolicyDataset(torch.utils.data.Dataset):
-    """Dataset Policy adatokhoz - Fixed for Stockfish evaluation data"""
+    """Dataset Policy adatokhoz - dinamikus policy mátrix generálás"""
     
     def __init__(self, states, policies):
-        """
-        Args:
-            states: Board states (tensors)
-            policies: List of move evaluations from Stockfish [(move_tuple, score), ...]
-        """
         self.states = torch.from_numpy(states).long()
-        
-        # Each policy is now a single (from_sq, to_sq) tuple per position
-        policy_matrices = []
-        for move in policies:
-            policy_matrix = torch.zeros(64, 64)
-            from_sq, to_sq = move
-            policy_matrix[from_sq, to_sq] = 1.0
-            policy_matrices.append(policy_matrix)
-        
-        self.policies = torch.stack(policy_matrices)
-        
+        self.policies_raw = policies
+    
     def __len__(self):
         return len(self.states)
     
     def __getitem__(self, idx):
-        return self.states[idx], self.policies[idx]
+        state = self.states[idx]
+        move = self.policies_raw[idx]
+        policy_matrix = torch.zeros(64, 64)
+        from_sq, to_sq = move
+        policy_matrix[from_sq, to_sq] = 1.0
+        return state, policy_matrix
 
 
 class HRMChess(nn.Module):

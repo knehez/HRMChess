@@ -606,7 +606,7 @@ def create_dataset_from_games(max_positions=10000):
     print(f"📥 Loading PGN games...")
     try:
         pgn_states, pgn_policies, pgn_fens = load_pgn_data(
-            "./lichess_db_standard_rated_2013-07.pgn",
+            "./lichess_db_standard_rated_2014-09.pgn",
             fen_to_bitboard_tensor,
             max_positions=pgn_target_positions,
             max_moves=30,
