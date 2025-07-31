@@ -473,7 +473,19 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
     
     # GPU MEMORY DETECTION & OPTIMIZATION
-    gpu_config = detect_gpu_memory_and_optimize_training()
+    if torch.cuda.is_available():
+        gpu_config = detect_gpu_memory_and_optimize_training()
+    else:
+        print("⚠️ CUDA not available - using default CPU training parameters!")
+        gpu_config = {
+            'batch_size': 8,
+            'lr_multiplier': 1.0,
+            'memory_gb': 0,
+            'free_memory_gb': 0,
+            'device_name': 'cpu',
+            'optimization_level': 'CPU_DEFAULT',
+            'memory_test_passed': True
+        }
     
     # Load or create dataset
     dataset_path = "fen_move_score_dataset.pt"
