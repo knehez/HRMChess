@@ -7,7 +7,6 @@ import chess
 import chess.engine
 import numpy as np
 import time
-from Chess import fen_to_bitboard_tensor
 from hrm_model import HRMChess
 from collections import defaultdict
 import json
@@ -16,78 +15,67 @@ import glob
 
 class ELORatingSystem:
     def __init__(self, model_path=None):
-        """ELO mérési rendszer inicializálása - konvolúciós HRM modellhez"""
+        """ELO mérési rendszer inicializálása - transformer-alapú HRM modellhez"""
+        import sys
+        from hrm_model import generate_all_possible_uci_moves
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Ha nincs megadva modell, listázzuk az elérhetőeket
         if model_path is None:
             model_path = self._select_model()
-        
         self.model_path = model_path
-        print(f"🎯 Loading convolutional HRM model from: {model_path}")
-        
-        # Load and detect model parameters from saved weights
+        print(f"🎯 Loading transformer HRM model from: {model_path}")
+        # Load checkpoint and detect transformer params
         try:
             checkpoint = torch.load(self.model_path, map_location='cpu', weights_only=False)
-            
-            # Only support convolutional models
-            hidden_dim, N, T = self._detect_conv_parameters(checkpoint)
-            
-            # Create convolutional HRM model
-            self.model = HRMChess(input_dim=20, hidden_dim=hidden_dim, N=N, T=T).to(self.device)
-            self.model_type = f"Convolutional-HRM-{hidden_dim}-N{N}-T{T}"
-            print(f"🏗️ Created convolutional HRM model: hidden_dim={hidden_dim}, N={N}, T={T}")
-                
+            # Try to get transformer params from hyperparams
+            if 'hyperparams' in checkpoint:
+                hyper = checkpoint['hyperparams']
+                emb_dim = hyper.get('emb_dim', hyper.get('hidden_dim', 128))  # <-- JAVÍTÁS: hidden_dim fallback
+                N = hyper.get('N', 4)
+                T = hyper.get('T', 4)
+            else:
+                emb_dim = 128
+                N = 4
+                T = 4
+            self.model = HRMChess(emb_dim=emb_dim, N=N, T=T).to(self.device)
+            self.model_type = f"Transformer-HRM-{emb_dim}-N{N}-T{T}"
+            print(f"🏗️ Created transformer HRM model: emb_dim={emb_dim}, N={N}, T={T}")
         except Exception as e:
             print(f"⚠️ Error detecting model parameters: {e}")
-            print("🔧 Creating default convolutional HRM model...")
-            self.model = HRMChess(input_dim=20, hidden_dim=128, N=8, T=8).to(self.device)
-            self.model_type = "Default-Convolutional-HRM-128"
-        
+            print("🔧 Creating default transformer HRM model...")
+            self.model = HRMChess(emb_dim=128, N=4, T=4).to(self.device)
+            self.model_type = "Default-Transformer-HRM-128"
         # Load model weights
         if os.path.exists(self.model_path):
             try:
                 checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
-                
-                # Handle both enhanced checkpoint format and legacy state_dict
                 if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                     state_dict = checkpoint['model_state_dict']
-                    # Show training info if available
                     if 'training_info' in checkpoint:
                         info = checkpoint['training_info']
                         epoch = info.get('epoch', 'N/A')
                         val_loss = info.get('val_loss', 'N/A')
-                        
-                        # Safe formatting for val_loss
-                        if isinstance(val_loss, (int, float)):
-                            val_loss_str = f"{val_loss:.4f}"
-                        else:
-                            val_loss_str = str(val_loss)
-                        
+                        val_loss_str = f"{val_loss:.4f}" if isinstance(val_loss, (int, float)) else str(val_loss)
                         print(f"📈 Model training info: Epoch {epoch}, Val Loss: {val_loss_str}")
                 elif isinstance(checkpoint, dict) and 'hyperparams' in checkpoint:
-                    # Legacy format with hyperparams but direct state_dict
                     state_dict = {k: v for k, v in checkpoint.items() if k not in ['hyperparams', 'training_info']}
                 else:
                     state_dict = checkpoint
-                
                 self.model.load_state_dict(state_dict)
-                print(f"✅ Convolutional HRM model loaded successfully: {self.model_type}")
-                
-                # Print model info
+                print(f"✅ Transformer HRM model loaded successfully: {self.model_type}")
                 total_params = sum(p.numel() for p in self.model.parameters())
                 print(f"📊 Model parameters: {total_params:,}")
-                print(f"🔧 Architecture: 8x8 2D Convolution + Meta-info → {self.model.hidden_dim}-dim → 64x64 move matrix")
-                
+                print(f"🔧 Architecture: Transformer + HRM heads → value bin classification")
             except Exception as e:
                 print(f"❌ Error loading model: {e}")
                 print("🔄 Initializing with random weights...")
         else:
             print(f"⚠️ Model file not found: {self.model_path}")
             print("🔄 Using randomly initialized model for testing...")
-        
         self.model.eval()
         self.games_played = []
+        # UCI move vocab for move tokenization
+        self.uci_move_list = generate_all_possible_uci_moves()
+        self.uci_move_to_idx = {uci: i for i, uci in enumerate(self.uci_move_list)}
     
     def _select_model(self):
         """Modell kiválasztása a felhasználó által"""
@@ -205,41 +193,56 @@ class ELORatingSystem:
         return hidden_dim, N, T
         
     def model_move(self, board, temperature=0.7, debug=False):
-        """Továbbfejlesztett modell lépés választás erősebb játékért"""
-        state = fen_to_bitboard_tensor(board.fen())
-        # Bitműveletekhez int típus kell!
-        state_tensor = torch.tensor(state, dtype=torch.long).unsqueeze(0).to(self.device)
-
-        with torch.no_grad():
-            # HRM move prediction - Policy-only model
-            move_logits = self.model(state_tensor)
-
-            policy_probs = torch.softmax(move_logits.view(-1) / temperature, dim=0)  # Temperature scaling
-
-        # Csak legális lépések
+        """Transformer HRM modell lépés választás (value bin head alapján, FEN+move token input, batch)"""
+        import torch
+        from hrm_model import fen_to_tokens, bin_to_score
+        fen = board.fen()
         legal_moves = list(board.legal_moves)
-        legal_probs = []
+        if not legal_moves:
+            raise ValueError("No legal moves available.")
+        # Prepare batch tokens
+        fen_tokens = torch.tensor([fen_to_tokens(fen)], dtype=torch.long).repeat(len(legal_moves), 1).to(self.device)  # [num_moves, 77]
+        uci_indices = []
+        valid_indices = []
+        missing_moves = []
+        for i, move in enumerate(legal_moves):
+            uci = move.uci()
+            idx = self.uci_move_to_idx.get(uci, None)
+            if idx is not None:
+                uci_indices.append(idx)
+                valid_indices.append(i)
+            else:
+                uci_indices.append(-1)  # Placeholder for invalid
+                missing_moves.append(uci)
+        if missing_moves:
+            print(f"⚠️ Warning: {len(missing_moves)} legal moves missing from uci_move_to_idx: {missing_moves}")
+        # Mask for valid moves
+        valid_mask = torch.tensor([i != -1 for i in uci_indices], dtype=torch.bool)
+        uci_tensor = torch.tensor([i if i != -1 else 0 for i in uci_indices], dtype=torch.long).to(self.device)  # [num_moves]
+        move_scores = np.full(len(legal_moves), -float('inf'), dtype=np.float32)
         move_info = []
-
-        for move in legal_moves:
-            idx = move.from_square * 64 + move.to_square
-            prob = policy_probs[idx].item()
-            legal_probs.append(prob)
-            move_info.append((move, prob))
-
-        if debug:
-            # Debug: show top 3 moves
-            move_info.sort(key=lambda x: x[1], reverse=True)
-            print(f"  Top moves: {move_info[:3]}")
-
-        # Erősebb lépés választás - top-k sampling helyett best move
-        legal_probs = np.array(legal_probs)
-
-        selected_idx = np.argmax(legal_probs)
-
+        with torch.no_grad():
+            # Only evaluate valid moves
+            if valid_mask.any():
+                fen_tokens_valid = fen_tokens[valid_mask]
+                uci_tensor_valid = uci_tensor[valid_mask]
+                out = self.model(fen_tokens_valid, uci_tensor_valid)  # [num_valid, num_bins]
+                for j, logits in enumerate(out):
+                    value_probs = torch.softmax(logits / temperature, dim=0)
+                    expected_bin = (value_probs * torch.arange(len(value_probs), device=value_probs.device)).sum().item()
+                    win_percent = bin_to_score(expected_bin, num_bins=len(value_probs))
+                    move_scores[valid_indices[j]] = win_percent
+                    move_info.append((legal_moves[valid_indices[j]], win_percent))
+            # For invalid moves, keep -inf
+            for i, idx in enumerate(uci_indices):
+                if idx == -1:
+                    move_info.append((legal_moves[i], -float('inf')))
+        selected_idx = int(np.argmax(move_scores))
         selected_move = legal_moves[selected_idx]
-        move_confidence = legal_probs[selected_idx]
-
+        move_confidence = move_scores[selected_idx]
+        if debug:
+            move_info_sorted = sorted(move_info, key=lambda x: x[1], reverse=True)
+            print(f"  Top moves: {[(str(m), round(s,2)) for m,s in move_info_sorted[:3]]}")
         return selected_move, move_confidence
     
     def play_vs_stockfish(self, stockfish_path, depth=1, time_limit=0.05):
@@ -436,37 +439,45 @@ class ELORatingSystem:
         
         # Enhanced puzzle set with easier tactical problems
         puzzles = [
-            # Very Easy (800-1000 ELO) - Basic tactics
+            # Easy (1000–1200 ELO) - back rank mate idea
             {
-                "fen": "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4",
-                "solution": ["h5f7"],  # Scholar's mate threat on f7
-                "description": "Scholar's mate threat",
-                "difficulty": "Very Easy",
-                "rating": 900
-            },
-            # Easy (1000-1200 ELO) - Simple combinations
-            {
-                "fen": "rnbqkb1r/pppp1ppp/5n2/4p3/2B1P3/8/PPPP1PPP/RNBQK1NR b KQkq - 0 1",
-                "solution": ["f6d5"],  # Knight centralization
-                "description": "Knight centralization",
+                "fen": "6k1/3r1ppp/1pR1p3/1p1pP3/rP6/5PP1/4P1KP/1R6 b - - 2 26",
+                "solution": ["d5d4", "c6c8", "d7d8", "c8d8"],
+                "description": "backRankMate endgame mate",
                 "difficulty": "Easy",
-                "rating": 1100
+                "rating": 1040
             },
-            # Medium (1200-1400 ELO) - Pins and forks
+            # Medium (1200–1400 ELO) - discovered attack
             {
-                "fen": "r2qkb1r/ppp2ppp/2np1n2/2b1p3/2B1P3/3P1N2/PPP1QPPP/RNB1K2R w KQkq - 0 6",
-                "solution": ["e2h5"],  # Pin attack on knight
-                "description": "Pin the knight",
-                "difficulty": "Medium", 
-                "rating": 1300
+                "fen": "r2q1r1k/ppp3pp/2nb4/3Q1b2/8/6N1/PPP1NPPP/R1B2RK1 w - - 1 14",
+                "solution": ["g3f5", "d6h2", "g1h2", "d8d5"],
+                "description": "advantage discoveredAttack kingsideAttack",
+                "difficulty": "Medium",
+                "rating": 1211
             },
-            # Alternative easy puzzle - piece capture
+            # Very Hard (1600+ ELO) - long mate sequence
             {
-                "fen": "rnbqkb1r/pppp1ppp/8/4p3/3nP3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 1",
-                "solution": ["d1d4", "c2c3"],  # Capture the knight or defend
-                "description": "Capture hanging piece",
-                "difficulty": "Basic",
-                "rating": 1000
+                "fen": "5b1k/4n1np/6p1/4Q3/3BP3/3b1P2/3q2PP/R5K1 b - - 4 29",
+                "solution": ["e7c6", "e5g7", "f8g7", "a1a8", "c6b8", "a8b8"],
+                "description": "long mate mateIn3",
+                "difficulty": "Very Hard",
+                "rating": 1677
+            },
+            # Hard (1400–1600 ELO) - deflection tactic
+            {
+                "fen": "8/3R4/7p/4K3/2BpP3/2kP2Pr/8/3b4 w - - 3 46",
+                "solution": ["d7d4", "h3h5", "e5f6", "c3d4"],
+                "description": "advantage deflection endgame",
+                "difficulty": "Hard",
+                "rating": 1402
+            },
+            # Hard (1400–1600 ELO) - advanced pawn and sacrifice
+            {
+                "fen": "8/p7/1P1k3p/P4pp1/2K5/8/5n2/7B b - - 0 39",
+                "solution": ["a7b6", "a5a6", "f2h1", "a6a7"],
+                "description": "advancedPawn advantage endgame",
+                "difficulty": "Hard",
+                "rating": 1509
             }
         ]
         

@@ -15,8 +15,7 @@ import uuid
 import glob
 
 # Import our trained model
-from Chess import fen_to_bitboard_tensor
-from hrm_model import HRMChess
+from hrm_model import HRMChess, fen_to_tokens, generate_all_possible_uci_moves
 
 app = Flask(__name__)
 app.secret_key = 'hrm_chess_secret_key_2025'  # Change in production
@@ -33,6 +32,9 @@ class ChessGameManager:
         self.model_path = model_path
         
         # Auto-detect and load model
+        # UCI lépés indexelés előkészítése (globális, fix sorrend)
+        self.uci_move_list = generate_all_possible_uci_moves()
+        self.uci_move_to_idx = {uci: i for i, uci in enumerate(self.uci_move_list)}
         self.load_model()
         
     def _select_model(self):
@@ -161,7 +163,7 @@ class ChessGameManager:
             print("❌ No trained HRM model found!")
             print("🔧 Please train the HRM model first using Chess.py")
             # Create a default HRM model for testing
-            self.model = HRMChess(input_dim=72, hidden_dim=192, N=8, T=8).to(self.device)
+            self.model = HRMChess(emb_dim=192, N=8, T=8).to(self.device)
             self.model_info = "HRM-Untrained-192"
         else:
             try:
@@ -213,7 +215,7 @@ class ChessGameManager:
                             print(f"🔍 Auto-detected HRM hidden_dim: {hidden_dim} (from L_net)")
                 
                 # Create HRM model with detected parameters
-                self.model = HRMChess(input_dim=72, hidden_dim=hidden_dim, N=N, T=T).to(self.device)
+                self.model = HRMChess(emb_dim=hidden_dim, N=N, T=T).to(self.device)
                 self.model.load_state_dict(model_state_dict)
                 
                 # Determine architecture type
@@ -238,71 +240,46 @@ class ChessGameManager:
                 
             except Exception as e:
                 print(f"❌ Error loading HRM model: {e}")
-                print(f"📋 Checkpoint keys: {list(checkpoint.keys()) if 'checkpoint' in locals() else 'N/A'}")
-                self.model = HRMChess(input_dim=72, hidden_dim=192, N=8, T=8).to(self.device)
-                self.model_info = "HRM-Error-192"
+                exit(0)
         
         self.model.eval()
         
     def get_model_move(self, board):
-        """Get the best move from the HRM model"""
+        """Get the best move from the HRM model (token-based, value head, win% confidence, robust UCI index handling)"""
         try:
-            # Convert board to tensor using simplified representation
-            state = fen_to_bitboard_tensor(board.fen())
-            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
-            
-            with torch.no_grad():
-                # HRM model prediction
-                model_output = self.model(state_tensor, return_value=True)
-                
-                if isinstance(model_output, tuple):
-                    # model: move_logits
-                    move_logits, values = model_output
-                    position_value = values.item()
-                else:
-                    # Legacy Policy-only model
-                    move_logits = model_output
-                    position_value = None
-                
-                policy_probs = torch.softmax(move_logits.view(-1), dim=0)  # Flatten to (4096,)
-            
-            # Get legal moves and their probabilities
+            from hrm_model import bin_to_score, fen_to_tokens
             legal_moves = list(board.legal_moves)
             if not legal_moves:
                 return None, 0.0, 0.0
-            
-            legal_probs = []
-            for move in legal_moves:
-                idx = move.from_square * 64 + move.to_square
-                legal_probs.append(policy_probs[idx].item())
-            
-            # Choose best move with temperature-based selection for stronger play
-            legal_probs = np.array(legal_probs)
-            
-            # SIMPLIFIED: Just take the best move (highest probability)
-            best_idx = np.argmax(legal_probs)  # Egyszerűen a legjobb lépés
-            
-            best_move = legal_moves[best_idx]
-            confidence = legal_probs[best_idx]
-            
-            # Use actual position value if available from Policy+Value model
-            if position_value is not None:
-                # Policy+Value model provides actual position evaluation
-                final_value = position_value
-            else:
-                # Legacy Policy-only model: calculate pseudo-value based on move confidence
-                # Higher confidence moves get higher pseudo-values
-                final_value = (confidence - 0.5) * 2.0  # Scale to [-1, 1] range
-            
-            return best_move, final_value, confidence
-            
+
+            move_scores = []
+            move_info = []
+            fen = board.fen()
+            with torch.no_grad():
+                fen_tokens = torch.tensor([fen_to_tokens(fen)], dtype=torch.long).to(self.device)  # [1, 77]
+                for move in legal_moves:
+                    uci = move.uci()
+                    uci_idx = self.uci_move_to_idx.get(uci, None)
+                    if uci_idx is None:
+                        move_scores.append(-float('inf'))
+                        move_info.append((move, -float('inf')))
+                        continue
+                    uci_tensor = torch.tensor([uci_idx], dtype=torch.long).to(self.device)
+                    out = self.model(fen_tokens, uci_tensor)
+                    value_logits = out.squeeze(0)
+                    value_probs = torch.softmax(value_logits, dim=0)
+                    expected_bin = (value_probs * torch.arange(len(value_probs), device=value_probs.device)).sum().item()
+                    win_percent = bin_to_score(expected_bin, num_bins=len(value_probs))
+                    move_scores.append(win_percent)
+                    move_info.append((move, win_percent))
+            move_scores = np.array(move_scores)
+            selected_idx = int(np.argmax(move_scores))
+            selected_move = legal_moves[selected_idx]
+            move_confidence = move_scores[selected_idx]
+            return selected_move, move_confidence / 100.0, move_confidence
         except Exception as e:
             print(f"HRM model error: {e}")
-            # Fallback to random move
-            legal_moves = list(board.legal_moves)
-            if legal_moves:
-                return np.random.choice(legal_moves), 0.0, 0.0
-            return None, 0.0, 0.0
+            exit(0)
 
 # Global game manager instance
 _game_manager = None

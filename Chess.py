@@ -13,7 +13,7 @@ import time
 import math
 
 # Import HRM model and related functions
-from hrm_model import HRMChess, PolicyDataset, train_step, train_loop, quick_train_eval
+from hrm_model import HRMChess, ValueBinDataset, train_loop
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -162,7 +162,7 @@ def detect_gpu_memory_and_optimize_training():
             'memory_test_passed': test_passed
         }
         
-        print(f"\n✅ OPTIMIZED TRAINING CONFIGURATION (FREE MEMORY BASED):")
+        print("\n✅ OPTIMIZED TRAINING CONFIGURATION (FREE MEMORY BASED):")
         print(f"   🎯 Batch Size: {result['batch_size']}")
         print(f"   📈 LR Multiplier: {result['lr_multiplier']:.2f}x")
         print(f"   🏷️ Level: {result['optimization_level']}")
@@ -176,8 +176,8 @@ def detect_gpu_memory_and_optimize_training():
         print(" Cannot proceed without GPU information.")
         exit(1)
 
-def load_pgn_data(pgn_path, fen_to_bitboard_tensor, max_positions=None, max_moves=40, min_elo=1600):
-    all_states, all_policies, all_fens = [], [], []
+def load_pgn_data(pgn_path, max_positions=None, max_moves=40, min_elo=1600):
+    all_fens = []
     
     # Debug counters
     stats = {
@@ -227,8 +227,8 @@ def load_pgn_data(pgn_path, fen_to_bitboard_tensor, max_positions=None, max_move
                 if not (result in ["1-0", "0-1"]):  # Kizárjuk a döntetleneket!
                     stats['result_rejected'] += 1
                     continue
-                    
-                if not (len(time_control) >= 3):
+                
+                if len(time_control) <= 3:
                     stats['timecontrol_rejected'] += 1
                     continue
                         
@@ -286,12 +286,7 @@ def load_pgn_data(pgn_path, fen_to_bitboard_tensor, max_positions=None, max_move
                             stats['pawn_moves'] += 1
                     
                     if include_move:
-                        state = fen_to_bitboard_tensor(board.fen())
-                        policy_sparse = (move.from_square, move.to_square)
                         current_fen = board.fen()  # Store the actual FEN
-                        
-                        all_states.append(state)
-                        all_policies.append(policy_sparse)
                         all_fens.append(current_fen)  # Store FEN for Stockfish evaluation
                         stats['positions_extracted'] += 1
                         
@@ -311,7 +306,7 @@ def load_pgn_data(pgn_path, fen_to_bitboard_tensor, max_positions=None, max_move
                 continue  # Skip games with missing/invalid data
     
     # ENHANCED statistics
-    print(f"\n📊 ENHANCED PGN Processing Statistics:")
+    print("\n📊 ENHANCED PGN Processing Statistics:")
     print(f"   Total games examined: {stats['total_games']:,}")
     print(f"   Successfully processed: {stats['processed_games']:,}")
     print(f"   Positions extracted: {stats['positions_extracted']:,}")
@@ -320,194 +315,22 @@ def load_pgn_data(pgn_path, fen_to_bitboard_tensor, max_positions=None, max_move
     print(f"   ├── Captures: {stats['captures']:,} ({stats['captures']/max(stats['positions_extracted'], 1)*100:.1f}%)")
     print(f"   └── Tactical moves: {stats['tactical_moves']:,} ({stats['tactical_moves']/max(stats['positions_extracted'], 1)*100:.1f}%)")
     
-    print(f"✅ BALANCED PGN adatok: {len(all_states):,} pozíció {stats['processed_games']} játszmából")
-    return all_states, all_policies, all_fens
-
-def load_puzzle_data(csv_path, fen_to_bitboard_tensor, max_puzzles=None, min_rating=800, max_rating=2200):
-    """
-    Lichess puzzle CSV betöltése taktikai training adatokhoz
-    
-    Args:
-        csv_path: Path to lichess puzzle CSV file
-        fen_to_tensor: FEN konvertáló függvény
-        max_puzzles: Maximum puzzles to load
-        min_rating: Minimum puzzle rating
-        max_rating: Maximum puzzle rating
-    
-    Returns:
-        puzzle_states, puzzle_policies, puzzle_fens
-    """
-    print(f"\n🧩 LOADING TACTICAL PUZZLES from {csv_path}")
-    
-    puzzle_states = []
-    puzzle_policies = []
-    puzzle_fens = []
-    
-    # Puzzle statistics
-    stats = {
-        'total_puzzles': 0,
-        'rating_filtered': 0,
-        'parse_errors': 0,
-        'processed_puzzles': 0,
-        'difficulty_easy': 0,
-        'difficulty_medium': 0,
-        'difficulty_hard': 0
-    }
-    
-    try:
-        with open(csv_path, 'r', encoding='utf-8') as csvfile:
-            reader = csv.reader(csvfile)
-            
-            # Skip header if present
-            first_row = next(reader, None)
-            if first_row and 'PuzzleId' in first_row[0]:
-                pass  # Header row, continue
-            else:
-                # First row is data, process it
-                csvfile.seek(0)
-                reader = csv.reader(csvfile)
-            
-            for row in reader:
-                if len(row) < 9:  # Ensure minimum columns
-                    continue
-                    
-                stats['total_puzzles'] += 1
-                
-                if stats['total_puzzles'] % 5000 == 0:
-                    print(f"Puzzles: {stats['total_puzzles']:,} ellenőrizve, {stats['processed_puzzles']:,} feldolgozva")
-                
-                if max_puzzles and stats['processed_puzzles'] >= max_puzzles:
-                    break
-                
-                try:
-                    # CSV format: PuzzleId,FEN,Moves,Rating,RatingDeviation,Popularity,NbPlays,Themes,GameUrl
-                    puzzle_id = row[0]
-                    fen = row[1]
-                    moves = row[2].split()
-                    rating = int(row[3])
-                    themes = row[7] if len(row) > 7 else ""
-                    
-                    # Rating filter
-                    if not (min_rating <= rating <= max_rating):
-                        stats['rating_filtered'] += 1
-                        continue
-                    
-                    # Parse the first move (puzzle solution)
-                    if len(moves) < 1:
-                        stats['parse_errors'] += 1
-                        continue
-                    
-                    first_move = moves[0]
-                    
-                    # Convert UCI move to board squares
-                    board = chess.Board(fen)
-                    try:
-                        move = chess.Move.from_uci(first_move)
-                        if move not in board.legal_moves:
-                            stats['parse_errors'] += 1
-                            continue
-                    except:
-                        stats['parse_errors'] += 1
-                        continue
-                    
-                    # Convert position to tensor
-                    state = fen_to_bitboard_tensor(fen)
-                    policy = (move.from_square, move.to_square)
-                    
-                    puzzle_states.append(state)
-                    puzzle_policies.append(policy)
-                    puzzle_fens.append(fen)
-                    stats['processed_puzzles'] += 1
-                    
-                    # Difficulty categorization
-                    if rating < 1200:
-                        stats['difficulty_easy'] += 1
-                    elif rating < 1800:
-                        stats['difficulty_medium'] += 1
-                    else:
-                        stats['difficulty_hard'] += 1
-                        
-                except (ValueError, IndexError, chess.InvalidMoveError) as e:
-                    stats['parse_errors'] += 1
-                    continue
-    
-    except FileNotFoundError:
-        print(f"⚠️ Puzzle file not found: {csv_path}")
-        return [], [], []
-    except Exception as e:
-        print(f"⚠️ Error loading puzzles: {e}")
-        return [], [], []
-    
-    # Enhanced statistics
-    print(f"\n📊 PUZZLE PROCESSING Statistics:")
-    print(f"   Total puzzles examined: {stats['total_puzzles']:,}")
-    print(f"   Successfully processed: {stats['processed_puzzles']:,}")
-    print(f"   Rating filtered: {stats['rating_filtered']:,}")
-    print(f"   Parse errors: {stats['parse_errors']:,}")
-    print(f"   ├── Easy (< 1200): {stats['difficulty_easy']:,} ({stats['difficulty_easy']/max(stats['processed_puzzles'], 1)*100:.1f}%)")
-    print(f"   ├── Medium (1200-1800): {stats['difficulty_medium']:,} ({stats['difficulty_medium']/max(stats['processed_puzzles'], 1)*100:.1f}%)")
-    print(f"   └── Hard (> 1800): {stats['difficulty_hard']:,} ({stats['difficulty_hard']/max(stats['processed_puzzles'], 1)*100:.1f}%)")
-    
-    print(f"✅ TACTICAL PUZZLES: {len(puzzle_states):,} pozíció betöltve")
-    return puzzle_states, puzzle_policies, puzzle_fens
-
-def fen_to_bitboard_tensor(fen):
-    """
-    Converts a FEN string to a compact 20-element uint64 vector representation.
-    
-    Vector elements:
-    - 0-11: Bitboards for pieces (P, N, B, R, Q, K, p, n, b, r, q, k)
-    - 12: Turn (all 1s for white, 0 for black)
-    - 13: White kingside castling rights (all 1s if available)
-    - 14: White queenside castling rights (all 1s if available)
-    - 15: Black kingside castling rights (all 1s if available)
-    - 16: Black queenside castling rights (all 1s if available)
-    - 17: En passant square bitboard
-    - 18: Halfmove clock (integer value)
-    - 19: Fullmove number (integer value)
-    """
-    board = chess.Board(fen)
-    
-    # Initialize a 20-element uint64 vector
-    vector = np.zeros(20, dtype=np.uint64)
-    
-    # Piece bitboards
-    piece_to_plane = {
-        'P': 0, 'N': 1, 'B': 2, 'R': 3, 'Q': 4, 'K': 5,
-        'p': 6, 'n': 7, 'b': 8, 'r': 9, 'q': 10, 'k': 11
-    }
-    
-    for piece_symbol, plane_index in piece_to_plane.items():
-        piece_type = chess.PIECE_SYMBOLS.index(piece_symbol.lower())
-        color = chess.WHITE if piece_symbol.isupper() else chess.BLACK
-        vector[plane_index] = board.pieces_mask(piece_type, color)
-            
-    # Turn
-    if board.turn == chess.WHITE:
-        vector[12] = np.uint64(0xFFFFFFFFFFFFFFFF)
+    # Duplikált FEN-ek szűrése indexekkel (memóriahatékony)
+    unique_fen_idx = {}
+    for idx, fen in enumerate(all_fens):
+        if fen not in unique_fen_idx:
+            unique_fen_idx[fen] = idx
+    num_duplicates = len(all_fens) - len(unique_fen_idx)
+    if num_duplicates > 0:
+        print(f"⚠️ Duplikált pozíciók száma: {num_duplicates}")
     else:
-        vector[12] = np.uint64(0)
-        
-    # Castling rights
-    if board.has_kingside_castling_rights(chess.WHITE):
-        vector[13] = np.uint64(0xFFFFFFFFFFFFFFFF)
-    if board.has_queenside_castling_rights(chess.WHITE):
-        vector[14] = np.uint64(0xFFFFFFFFFFFFFFFF)
-    if board.has_kingside_castling_rights(chess.BLACK):
-        vector[15] = np.uint64(0xFFFFFFFFFFFFFFFF)
-    if board.has_queenside_castling_rights(chess.BLACK):
-        vector[16] = np.uint64(0xFFFFFFFFFFFFFFFF)
-        
-    # En passant square
-    if board.ep_square:
-        vector[17] = np.uint64(1) << board.ep_square
-        
-    # Halfmove and fullmove clocks
-    vector[18] = np.uint64(board.halfmove_clock)
-    vector[19] = np.uint64(board.fullmove_number)
-    
-    return vector
+        print("✅ Nincsenek duplikált pozíciók a PGN adatok között.")
+    # Csak az egyedi pozíciók és policy-k
+    unique_indices = list(unique_fen_idx.values())
+    all_fens = [all_fens[i] for i in unique_indices]
 
+    print(f"✅ BALANCED PGN adatok: {len(all_fens):,} pozíció {stats['processed_games']} játszmából")
+    return all_fens
 
 def get_manual_parameters():
     """Get manual hyperparameters from user"""
@@ -559,7 +382,7 @@ def get_manual_parameters():
     estimated_params = hidden_dim * (hidden_dim * 6 + 64*64) + hidden_dim * 3
     complexity_level = "Light" if total_steps <= 8 else "Medium" if total_steps <= 16 else "Heavy"
     
-    print(f"\n✅ Manual Configuration:")
+    print("\n✅ Manual Configuration:")
     print(f"   • hidden_dim: {hidden_dim}")
     print(f"   • N: {N}, T: {T}")
     print(f"   • Total HRM steps: {total_steps}")
@@ -581,14 +404,12 @@ def get_manual_parameters():
     
     return hidden_dim, N, T
 
-
-
 # Import StockfishEvaluator and ParallelStockfishEvaluator from the new module
 from stockfish_eval import StockfishEvaluator, ParallelStockfishEvaluator
 
 def create_dataset_from_games(max_positions=10000):
     """
-    Dataset létrehozása játszmákból és Stockfish értékeléssel - egyszerűsített megközelítés
+    Dataset létrehozása játszmákból - csak PGN alapú, puzzle nélkül
     
     Args:
         max_positions: Maximális pozíciók száma a dataset-ben
@@ -596,83 +417,52 @@ def create_dataset_from_games(max_positions=10000):
     import math
     import time
 
-    print("\n🎮 Creating dataset from games with Stockfish evaluation...")
-    print(f"🎯 Target positions: {max_positions:,}")
+    print("\n🎮 Creating dataset from games...")
 
-    puzzle_ratio = 0.4
-    pgn_ratio = 1.0 - puzzle_ratio
-    pgn_target_positions = int(max_positions * pgn_ratio)
-    
-    print(f"📥 Loading PGN games...")
+    print("📥 Loading PGN games...")
     try:
-        pgn_states, pgn_policies, pgn_fens = load_pgn_data(
-            "./lichess_db_standard_rated_2014-09.pgn",
-            fen_to_bitboard_tensor,
-            max_positions=pgn_target_positions,
+        pgn_fens = load_pgn_data(
+            "./lichess_db_standard_rated_2015-05.pgn",
+            max_positions=max_positions,
             max_moves=30,
             min_elo=1600
         )
-        print(f"✅ Loaded {len(pgn_states):,} positions from PGN")
+        print(f"✅ Loaded {len(pgn_fens):,} positions from PGN")
     except:
-        print("⚠️ PGN file not found, using minimal dataset")
-        pgn_states, pgn_policies, pgn_fens = [], [], []
+        print("⚠️ PGN file not found")
+        exit(0)
 
-    print(f"📥 Loading tactical puzzles...")
-    puzzle_target = int(max_positions * puzzle_ratio)
+    all_fens = pgn_fens
 
-    try:
-        puzzle_states, puzzle_policies, puzzle_fens = load_puzzle_data(
-            "./lichess_db_puzzle.csv",
-            fen_to_bitboard_tensor,
-            max_puzzles=puzzle_target,
-            min_rating=800,
-            max_rating=2500
-        )
-        print(f"✅ Loaded {len(puzzle_states):,} tactical positions from CSV")
-    except:
-        print("⚠️ Puzzle CSV file not found, using only PGN data")
-        puzzle_states, puzzle_policies, puzzle_fens = [], [], []
-
-    print(f"\n🎯 COMBINING PGN + PUZZLE DATA:")
-    print(f"   📊 PGN positions: {len(pgn_states):,}")
-    print(f"   🧩 Puzzle positions: {len(puzzle_states):,}")
-
-    all_states = pgn_states + puzzle_states
-    all_policies = pgn_policies + puzzle_policies
-
-    if len(all_states) == 0:
-        print("❌ No training data available!")
-        return None, None
-
-    print(f"📊 Total positions loaded: {len(all_states):,}")
-
-    adequacy_ratio = len(all_states) / max_positions if max_positions > 0 else 0
-    if adequacy_ratio < 0.5:
-        print(f"⚠️ Warning: Only {adequacy_ratio*100:.1f}% of target positions loaded!")
-        print(f"💡 Consider: checking file paths, lowering rating filters, or reducing target size")
-    elif adequacy_ratio >= 1.0:
-        print(f"✅ Excellent: {adequacy_ratio:.1f}x target positions available")
+    # Duplikált FEN-ek szűrése indexekkel (memóriahatékony)
+    unique_fen_idx = {}
+    for idx, fen in enumerate(all_fens):
+        if fen not in unique_fen_idx:
+            unique_fen_idx[fen] = idx
+    num_duplicates = len(all_fens) - len(unique_fen_idx)
+    if num_duplicates > 0:
+        print(f"⚠️ Duplikált pozíciók száma: {num_duplicates}")
     else:
-        print(f"✅ Good: {adequacy_ratio*100:.1f}% of target positions loaded")
+        print("✅ Nincsenek duplikált pozíciók a PGN adatok között.")
+    
+    # Csak az egyedi pozíciók és policy-k
+    unique_indices = list(unique_fen_idx.values())
+    all_fens = [all_fens[i] for i in unique_indices]
 
-    if len(all_states) > max_positions:
-        print(f"🎯 Randomly selecting {max_positions:,} positions from {len(all_states):,} available")
-        indices = np.random.choice(len(all_states), max_positions, replace=False)
-        all_states = [all_states[i] for i in indices]
-        all_policies = [all_policies[i] for i in indices]
+    if len(all_fens) == 0:
+        print("❌ No training data available!")
+        exit(0)
 
-    # Combine policies directly from PGN and puzzle sources
-    combined_policies = all_policies
-    combined_states = all_states
+    print(f"📊 Total positions loaded: {len(all_fens):,}")
 
-    print(f"\n✅ Policy dataset created WITHOUT Stockfish evaluation!")
-    print(f"   📊 Positions: {len(combined_states):,}")
-    print(f"   📊 Policies: {len(combined_policies):,}")
-    if len(combined_states) > 0:
-        total_moves = sum(1 if isinstance(p, tuple) else len(p) for p in combined_policies)
-        print(f"   📊 Total moves (sum of all policy entries): {total_moves:,}")
-        print(f"   📊 Average moves per position: {total_moves/len(combined_states):.2f}")
-    return combined_states, combined_policies
+    # --- Stockfish értékelés minden pozícióra ---
+    print("\n🤖 Evaluating all legal moves for all positions...")
+    stockfish = ParallelStockfishEvaluator(stockfish_path="stockfish.exe", movetime=10, num_evaluators=int(os.cpu_count() * 0.8) or 2)
+    all_move_evals = stockfish.evaluate_positions_parallel(all_fens)
+    stockfish.close()
+
+    print(f"✅ Stockfish-evaluated dataset: {len(all_fens):,} positions")
+    return all_fens, all_move_evals
 
 if __name__ == "__main__":
     print("🏗️ HRM CHESS MODEL TRAINING")
@@ -686,7 +476,7 @@ if __name__ == "__main__":
     gpu_config = detect_gpu_memory_and_optimize_training()
     
     # Load or create dataset
-    dataset_path = "chess_positions_dataset.pt"
+    dataset_path = "fen_move_score_dataset.pt"
     
     if not os.path.exists(dataset_path):
         print(f"\n📝 Dataset not found: {dataset_path}")
@@ -695,48 +485,43 @@ if __name__ == "__main__":
         # Ask user for dataset size
         while True:
             try:
-                max_positions = int(input("Enter dataset size (number of positions, e.g., 20000): "))
-                if max_positions > 0:
+                max_games = int(input("Enter number of games (number of games, e.g., 20000): "))
+                if max_games > 0:
                     break
                 else:
                     print("❌ Please enter a positive number")
             except ValueError:
                 print("❌ Please enter a valid integer")
         
-        print(f"🎯 Creating dataset with {max_positions:,} positions")
+        print(f"🎯 Creating dataset with {max_games:,} games")
         
         # Create dataset from games and puzzles with user-specified size
-        states, policies = create_dataset_from_games(max_positions)
-        
-        if states is None:
-            print("❌ Failed to create dataset!")
-            exit(1)
-        
-        # Save dataset
-        print("💾 Saving dataset...")
-        # Calculate average moves per position from the policies data
-        total_moves_in_dataset = sum(len(moves) for moves in policies)
-        avg_moves_per_position = total_moves_in_dataset / len(states) if states else 0
+        fens, moves = create_dataset_from_games(max_games)
+
+        # Save as vector of (fen, move, score) tuples in a .pt file, with metadata
+        fen_move_score_vec = []
+        for fen, move_list in zip(fens, moves):
+            for move_tuple in move_list:
+                move, score = move_tuple
+                fen_move_score_vec.append((fen, move, score))
+                
+        output_pt = "fen_move_score_dataset.pt"
         
         dataset_info = {
-            'states': np.array(states, dtype=np.uint64),
-            'policies': policies,
+            'data': fen_move_score_vec,
             'info': {
                 'created': time.time(),
-                'source': 'PGN + Tactical Puzzles (Comprehensive Stockfish evaluation)',
-                'positions': len(states),
-                'stockfish_evaluation': 'TOP_K_MOVES',
-                'evaluation_method': 'top_k_move_evaluation',
-                'data_mix': 'Balanced PGN games + tactical puzzles',
-                'gpu_optimized': True,
-                'gpu_config': gpu_config,
-                'user_specified_size': max_positions,
-                'avg_moves_per_position': avg_moves_per_position
+                'source': 'PGN + Stockfish (all legal moves, deduped FENs)',
+                'base_positions': len(fens),
+                'total_positions': len(fen_move_score_vec),
+                'stockfish_evaluation': 'all_legal_moves',
+                'evaluation_method': 'all_moves_winpercent',
+                'data_format': '(fen, move, score)',
+                'number_of_games': max_games
             }
         }
-        
-        torch.save(dataset_info, dataset_path)
-        print(f"✅ Dataset saved to: {dataset_path}")
+        torch.save(dataset_info, output_pt)
+        print(f"✅ Saved {len(fen_move_score_vec):,} (fen + move, score) pairs and metadata to {output_pt}")
         
         # Use the created data
         data = dataset_info
@@ -745,35 +530,47 @@ if __name__ == "__main__":
         print(f"\n📥 Loading existing dataset: {dataset_path}")
         data = torch.load(dataset_path, weights_only=False)
     
-    states = data['states']
-    policies = data['policies']
-    info = data['info']
-    
+    # Extract (fen + move, score) tuples from dataset_info
+    dataset_info = data if 'data' in data else data.get('dataset_info', {})
+    fen_move_score_vec = dataset_info['data']
+    info = dataset_info['info']
+
     print("✅ Loaded dataset:")
-    print(f"   📊 Positions: {len(states):,}")
+    print(f"   📊 Positions: {len(fen_move_score_vec):,}")
     print(f"   🤖 Source: {info.get('source', 'Unknown')}")
     print(f"   🎮 Data mix: {info.get('data_mix', 'Unknown composition')}")
     print(f"   🖥️ GPU Optimized: {info.get('gpu_optimized', False)}")
-    
-    # training mode
-    print("\n🎯 TRAINING MODE")
-    print("   • Input: 72-dim vector → 8x8 2D conv + extra features")
-    print("   • Policy Head: 64x64 move matrix")
-    print("   • Dataset: Balanced PGN games + tactical puzzles")
-    
-    print("\n⚙️ HRM PARAMETER EXPLANATION:")
-    print("   • N: Number of high-level reasoning cycles")
-    print("   • T: Steps per cycle (low-level processing)")
-    print("   • Total HRM steps = N × T")
-    print("   • hidden_dim: Neural network width")
-    print("   • Optimal balance: complexity vs speed vs accuracy")
-    
-    # Configuration
-    data_path = dataset_path
-    model_path = "hrm_chess_model.pt"
-    
-    # Get dataset info
-    dataset_size = len(states)
+
+    # --- UCI move vocabulary and binning ---
+    from hrm_model import generate_all_possible_uci_moves, score_to_bin
+    uci_vocab = generate_all_possible_uci_moves()
+    uci2idx = {uci: i for i, uci in enumerate(uci_vocab)}
+    num_bins = 128  # should match model
+
+    fen_tokens = []
+    uci_tokens = []
+    target_bins = []
+    debug_prints = 0
+    for fen, move, score in fen_move_score_vec:
+        fen_ascii = [ord(c) for c in fen.ljust(77)[:77]]
+        uci_idx = uci2idx.get(move)
+        if uci_idx is None:
+            if debug_prints < 10:
+                print(f"[DEBUG] Skipped: move not in uci2idx: {move}")
+                debug_prints += 1
+            continue
+        try:
+            bin_idx = score_to_bin(float(score), num_bins=num_bins)
+        except Exception as e:
+            if debug_prints < 10:
+                print(f"[DEBUG] Skipped: score conversion error: {score}, error: {e}")
+                debug_prints += 1
+            continue
+        fen_tokens.append(fen_ascii)
+        uci_tokens.append([uci_idx])
+        target_bins.append(bin_idx)
+
+    dataset_size = len(fen_tokens)
     print(f"\n📊 Dataset size: {dataset_size:,} positions")
     
     # MANUAL PARAMETERS
@@ -781,7 +578,7 @@ if __name__ == "__main__":
     
     # Apply GPU optimizations
     batch_size = gpu_config['batch_size']
-    lr = 2e-4 * gpu_config['lr_multiplier']
+    lr = 1e-4 * gpu_config['lr_multiplier']
     model_size = f"GPU_MANUAL-{N}x{T}-{gpu_config['optimization_level']}"
     
     print("\n🔧 GPU OPTIMIZATIONS APPLIED:")
@@ -790,7 +587,7 @@ if __name__ == "__main__":
     print(f"   🖥️ GPU Level: {gpu_config['optimization_level']}")
     
     # HRM modell létrehozása optimalizált paraméterekkel
-    model = HRMChess(input_dim=20, hidden_dim=hidden_dim, N=N, T=T).to(device)
+    model = HRMChess(emb_dim=hidden_dim, N=N, T=T).to(device)
     
     # Model info
     total_params = sum(p.numel() for p in model.parameters())
@@ -801,13 +598,6 @@ if __name__ == "__main__":
     print(f"📊 Total parameters: {total_params:,}")
     print(f"📊 Trainable parameters: {trainable_params:,}")
     print(f"🔄 HRM reasoning steps: {hrm_steps} (N={N} × T={T})")
-    print("🏗️ Architecture: HRM")
-    print("   • Board conv: 8x8 → conv2d → 4x4 → flatten")
-    print("   • Extra processor: 8-dim meta info → linear")
-    print("   • Feature combiner: board + extra → hidden_dim")
-    print("   • Board enhancer: hidden_dim → hidden_dim → hidden_dim")
-    print(f"   • HRM modules: L_net and H_net with N={N}, T={T}")
-    print("   • Policy Head: Move prediction (hidden_dim → 64*64)")
     
     # GPU-optimized training configuration
     epochs = 30  # Több epoch a jobb konvergenciáért
@@ -824,21 +614,8 @@ if __name__ == "__main__":
     print(f"   🖥️ GPU: {gpu_config['device_name']} ({gpu_config['memory_gb']:.1f} GB)")
     print(f"   🏷️ Optimization Level: {gpu_config['optimization_level']}")
     
-    # Memory usage estimation
-    estimated_memory_per_batch = (batch_size * 72 * 4 + batch_size * 64 * 64 * 4) / (1024**3)  # Rough estimate in GB
-    print(f"   📊 Estimated memory/batch: ~{estimated_memory_per_batch:.2f} GB)")
-    print(f"   • HRM steps: {N}×{T}={N*T}")
-    print(f"   • Parameters: {total_params:,}")
-    print(f"   • Dataset: {dataset_size:,} positions")
-    print(f"   🖥️ GPU: {gpu_config['device_name']} ({gpu_config['memory_gb']:.1f} GB)")
-    print(f"   🏷️ Optimization Level: {gpu_config['optimization_level']}")
-    
-    # Memory usage estimation
-    estimated_memory_per_batch = (batch_size * 72 * 4 + batch_size * 64 * 64 * 4) / (1024**3)  # Rough estimate in GB
-    print(f"   📊 Estimated memory/batch: ~{estimated_memory_per_batch:.2f} GB")
-    
-    # Create Policy dataset
-    dataset = PolicyDataset(states, policies)
+    # Create value bin dataset
+    dataset = ValueBinDataset(fen_tokens, uci_tokens, target_bins)
     print(f"\n📊 Dataset: {len(dataset):,} positions")
     print("🚀 Starting GPU-optimized HRM training with warmup...")
     
@@ -866,13 +643,11 @@ if __name__ == "__main__":
             'gpu_config': gpu_config
         }
     }
+    model_path = "hrm_chess_model.pt"
     torch.save(final_checkpoint, model_path)
     print("\n✅ Training completed!")
-    print(f"💾 Model saved to: {model_path}")
-    print(f"🏆 HRM (N={N}, T={T}, hidden_dim={hidden_dim}) with {total_params:,} parameters")
-    print(f"📊 Trained on {len(dataset):,} positions with Warmup mode")
-    print(f"🎮 Dataset: Balanced PGN games + tactical puzzles for enhanced gameplay")
-    print(f"🔥 Warmup: 3 epochs with linear warmup + cosine annealing")
-    
-    print("🎯 Expected: Enhanced move prediction + position evaluation + tactical strength")
-    print("⚔️ Ready for tactical fine-tuning and stronger gameplay!")
+    print("💾 Model saved to: {model_path}")
+    print("🏆 HRM (N={N}, T={T}, hidden_dim={hidden_dim}) with {total_params:,} parameters")
+    print("📊 Trained on {len(dataset):,} positions with Warmup mode")
+    print("🎮 Dataset: Balanced PGN games + tactical puzzles for enhanced gameplay")
+    print("🔥 Warmup: 3 epochs with linear warmup + cosine annealing")

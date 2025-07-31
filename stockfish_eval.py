@@ -1,3 +1,4 @@
+import math
 import chess
 import subprocess
 import os
@@ -14,12 +15,25 @@ class StockfishEvaluator:
 
     def _init_engine(self):
         try:
-            if os.path.exists(self.stockfish_path):
-                print(f"🤖 Stockfish found: {self.stockfish_path}")
-            else:
-                print(f"❌ Stockfish not found at: {self.stockfish_path}")
-                print("🔍 Looking for stockfish in system PATH...")
-                self.stockfish_path = "stockfish"
+            tried_paths = [self.stockfish_path]
+            if self.stockfish_path != "./stockfish.exe":
+                tried_paths.append("./stockfish.exe")
+            if self.stockfish_path != "stockfish":
+                tried_paths.append("stockfish")
+            found = False
+            for path in tried_paths:
+                if os.path.exists(path) or path == "stockfish":
+                    self.stockfish_path = path
+                    found = True
+                    if path != "stockfish":
+                        print(f"🤖 Stockfish found: {self.stockfish_path}")
+                    else:
+                        print(f"🔍 Trying to use stockfish from system PATH...")
+                    break
+            if not found:
+                print(f"❌ Stockfish not found at any of: {tried_paths}")
+                self.initialized = False
+                return
             print("🚀 Starting Stockfish engine...")
             self.process = subprocess.Popen(
                 [self.stockfish_path],
@@ -48,83 +62,76 @@ class StockfishEvaluator:
                 print(f"⚠️ Error sending command: {e}")
                 self.initialized = False
 
-    def _read_line(self, timeout=3.0):
+    def _read_line(self):
+        # Blocking, simple readline (no timeout/threading)
         if not self.process or not self.process.stdout:
             return None
         try:
-            import threading
-            import queue
-            result_queue = queue.Queue()
-            def read_line():
-                try:
-                    line = self.process.stdout.readline()
-                    result_queue.put(line)
-                except Exception as e:
-                    result_queue.put(None)
-            thread = threading.Thread(target=read_line)
-            thread.daemon = True
-            thread.start()
-            thread.join(timeout=timeout)
-            if not result_queue.empty():
-                line = result_queue.get_nowait()
-                if line:
-                    return line.strip()
+            line = self.process.stdout.readline()
+            if line:
+                return line.strip()
             return None
-        except Exception as e:
+        except Exception:
             return None
 
     def _wait_for_response(self, expected, timeout=5.0):
         start_time = time.time()
         while time.time() - start_time < timeout:
-            line = self._read_line(1.0)
+            line = self._read_line()
             if line and expected in line:
                 return True
             if not line:
                 continue
         return False
 
-    def get_top_k_moves(self, fen, k=3):
+    def stockfish_cp_to_winpercent(self, cp: int) -> float:
+        return 0.5 * (2.0 / (1.0 + math.exp(-0.00368208 * cp)))
+
+    def get_all_moves(self, fen):
+        """
+        Visszaadja az összes lehetséges lépést és értékét az adott FEN állásban.
+        Minden lépést végrehajt, értékel, majd visszaállítja a táblát.
+        Visszatérési érték: List[(move_uci, score)]
+        """
         if not self.initialized or not self.process:
             print("⚠️ Stockfish engine not initialized")
             return []
         try:
-            self._send_command("ucinewgame")
-            self._send_command(f"setoption name MultiPV value {k}")
-            self._send_command(f"position fen {fen}")
-            self._send_command(f"go movetime {self.movetime}")
-            top_moves = {}
-            start_time = time.time()
-            while time.time() - start_time < (self.movetime / 1000) + 2:
-                line = self._read_line(timeout=1.0)
-                if not line:
-                    continue
-                if line.startswith('bestmove'):
-                    break
-                if 'multipv' in line and ('score cp' in line or 'score mate' in line):
-                    parts = line.split()
-                    try:
-                        pv_index = parts.index('multipv') + 1
-                        move_index = parts.index('pv') + 1
-                        rank = int(parts[pv_index])
-                        move_uci = parts[move_index]
-                        score = 0.0
-                        if 'score cp' in line:
-                            score_index = parts.index('cp') + 1
-                            cp_score = int(parts[score_index])
-                            score = max(-1.0, min(1.0, cp_score / 300.0))
-                        elif 'score mate' in line:
-                            mate_index = parts.index('mate') + 1
-                            mate_in_moves = int(parts[mate_index])
-                            score = 1.0 if mate_in_moves > 0 else -1.0
-                        if rank <= k:
-                            top_moves[rank] = (move_uci, score)
-                    except (ValueError, IndexError):
+            board = chess.Board(fen)
+            all_moves = list(board.legal_moves)
+            move_scores = []
+            for move in all_moves:
+                move_uci = move.uci()
+                # Az eredeti állásból kiindulva, a lépést a position parancsban adjuk át
+                board_after = board.copy()
+                board_after.push(move)
+                self._send_command("ucinewgame")
+                self._send_command(f"position fen {board_after.fen()}")
+                self._send_command(f"go movetime {self.movetime}")
+                
+                score = 0.0
+                start_time = time.time()
+                while time.time() - start_time < (self.movetime / 1000) + 2:
+                    line = self._read_line()
+                    if not line:
                         continue
-            self._send_command("setoption name MultiPV value 1")
-            return [top_moves[i] for i in sorted(top_moves.keys())]
+                    if line.startswith('bestmove'):
+                        break
+                    if 'score cp' in line:
+                        parts = line.split()
+                        score_index = parts.index('cp') + 1
+                        cp_score = int(parts[score_index])
+                        score = self.stockfish_cp_to_winpercent(-cp_score)
+                    elif 'score mate' in line:
+                        parts = line.split()
+                        mate_index = parts.index('mate') + 1
+                        mate_in_moves = int(parts[mate_index])
+                        score = 1.0 if mate_in_moves < 0 else 0.0
+                board_after.pop()  # Visszaállítjuk az eredeti állást
+                move_scores.append((move_uci, score))
+            return move_scores
         except Exception as e:
-            print(f"⚠️ Error getting top k moves: {e}")
-            self._send_command("setoption name MultiPV value 1")
+            print(f"⚠️ Error getting all moves: {e}")
             return []
 
     def close(self):
@@ -207,17 +214,15 @@ class ParallelStockfishEvaluator:
             while True:
                 try:
                     position_idx, fen = work_queue.get(timeout=1.0)
-                    start_time = time.time()
-                    top_moves = evaluator.get_top_k_moves(fen, k=1)
+                    all_moves = evaluator.get_all_moves(fen)
                     move_evaluations = []
-                    board = chess.Board(fen)
-                    for move_uci, score_cp in top_moves:
+                    
+                    for move_uci, score_cp in all_moves:
                         try:
-                            move = chess.Move.from_uci(move_uci)
-                            move_evaluations.append(((move.from_square, move.to_square), score_cp))
+                            move_evaluations.append((move_uci, score_cp))
                         except:
                             continue
-                    eval_time = time.time() - start_time
+                    
                     with results_lock:
                         results[position_idx] = move_evaluations
                     processed_count += 1
