@@ -590,7 +590,7 @@ if __name__ == "__main__":
     
     # Apply GPU optimizations
     batch_size = gpu_config['batch_size']
-    lr = 1e-4 * gpu_config['lr_multiplier']
+    lr = 1e-5 * gpu_config['lr_multiplier']
     model_size = f"GPU_MANUAL-{N}x{T}-{gpu_config['optimization_level']}"
     
     print("\n🔧 GPU OPTIMIZATIONS APPLIED:")
@@ -598,8 +598,11 @@ if __name__ == "__main__":
     print(f"   📈 Learning Rate: {lr:.6f} (base: 2e-4 × {gpu_config['lr_multiplier']:.2f})")
     print(f"   🖥️ GPU Level: {gpu_config['optimization_level']}")
     
-    # HRM modell létrehozása optimalizált paraméterekkel
+    # HRM modell létrehozása optimalizált paraméterekkel, több GPU támogatással
     model = HRMChess(emb_dim=hidden_dim, N=N, T=T).to(device)
+    if torch.cuda.device_count() > 1:
+        print(f"🔗 Using {torch.cuda.device_count()} GPUs (DataParallel)")
+        model = torch.nn.DataParallel(model)
     
     # Model info
     total_params = sum(p.numel() for p in model.parameters())
@@ -635,8 +638,13 @@ if __name__ == "__main__":
     train_loop(model, dataset, epochs=epochs, batch_size=batch_size, lr=lr, warmup_epochs=3, device=device)
     
     # Save final model with hyperparameters and GPU info
+    # DataParallel esetén a .module.state_dict()-et kell menteni
+    if isinstance(model, torch.nn.DataParallel):
+        state_dict = model.module.state_dict()
+    else:
+        state_dict = model.state_dict()
     final_checkpoint = {
-        'model_state_dict': model.state_dict(),
+        'model_state_dict': state_dict,
         'hyperparams': {
             'hidden_dim': hidden_dim,
             'N': N,
@@ -658,8 +666,8 @@ if __name__ == "__main__":
     model_path = "hrm_chess_model.pt"
     torch.save(final_checkpoint, model_path)
     print("\n✅ Training completed!")
-    print("💾 Model saved to: {model_path}")
-    print("🏆 HRM (N={N}, T={T}, hidden_dim={hidden_dim}) with {total_params:,} parameters")
-    print("📊 Trained on {len(dataset):,} positions with Warmup mode")
+    print(f"💾 Model saved to: {model_path}")
+    print(f"🏆 HRM (N={N}, T={T}, hidden_dim={hidden_dim}) with {total_params:,} parameters")
+    print(f"📊 Trained on {len(dataset):,} positions with Warmup mode")
     print("🎮 Dataset: Balanced PGN games + tactical puzzles for enhanced gameplay")
     print("🔥 Warmup: 3 epochs with linear warmup + cosine annealing")
