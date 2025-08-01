@@ -59,13 +59,15 @@ class HRMChess(nn.Module):
         # LayerNorm a transformer kimenetére
         self.post_transformer_norm = nn.LayerNorm(emb_dim)
 
+
         # L_net: Low-level module (zL, zH, transformer_out) -> zL
         self.L_net = nn.Sequential(
             nn.Linear(emb_dim * 3, emb_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(emb_dim, emb_dim),
-            nn.ReLU()
+            nn.ReLU(),
+            nn.LayerNorm(emb_dim)
         )
 
         # H_net: High-level module (zH, zL) -> zH
@@ -74,11 +76,13 @@ class HRMChess(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(emb_dim, emb_dim),
-            nn.ReLU()
+            nn.ReLU(),
+            nn.LayerNorm(emb_dim)
         )
 
-        # Value head: bin classification
+        # Value head: bin classification (LayerNorm a fej előtt)
         self.value_head = nn.Sequential(
+            nn.LayerNorm(emb_dim),
             nn.Linear(emb_dim, emb_dim),
             nn.ReLU(),
             nn.Linear(emb_dim, num_bins)

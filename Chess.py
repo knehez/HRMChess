@@ -63,7 +63,6 @@ def detect_gpu_memory_and_optimize_training():
                 'optimization_level': 'HIGH_END_FREE'
             }
             print(f"🚀 HIGH-END FREE MEMORY ({free_gb:.1f}GB+ available)")
-            
         elif free_gb >= 14:  # Jó mennyiségű szabad memória
             batch_config = {
                 'batch_size': 48,
@@ -71,7 +70,6 @@ def detect_gpu_memory_and_optimize_training():
                 'optimization_level': 'HIGH_FREE'
             }
             print(f"🔥 HIGH FREE MEMORY ({free_gb:.1f}GB available)")
-            
         elif free_gb >= 10:  # Közepes szabad memória
             batch_config = {
                 'batch_size': 32,
@@ -79,7 +77,6 @@ def detect_gpu_memory_and_optimize_training():
                 'optimization_level': 'MID_HIGH_FREE'
             }
             print(f"⚡ MID-HIGH FREE MEMORY ({free_gb:.1f}GB available)")
-            
         elif free_gb >= 6:   # Átlagos szabad memória
             batch_config = {
                 'batch_size': 24,
@@ -87,7 +84,6 @@ def detect_gpu_memory_and_optimize_training():
                 'optimization_level': 'MID_FREE'
             }
             print(f"💪 MID FREE MEMORY ({free_gb:.1f}GB available)")
-            
         elif free_gb >= 4:   # Kevés szabad memória
             batch_config = {
                 'batch_size': 16,
@@ -95,7 +91,6 @@ def detect_gpu_memory_and_optimize_training():
                 'optimization_level': 'LOW_MID_FREE'
             }
             print(f"🎯 LOW-MID FREE MEMORY ({free_gb:.1f}GB available)")
-            
         elif free_gb >= 2:   # Nagyon kevés szabad memória
             batch_config = {
                 'batch_size': 12,
@@ -103,12 +98,19 @@ def detect_gpu_memory_and_optimize_training():
                 'optimization_level': 'LOW_FREE'
             }
             print(f"⚠️ LOW FREE MEMORY ({free_gb:.1f}GB available)")
-            
         else:  # <2GB szabad VRAM
             print(f"❌ Insufficient free GPU memory (<2GB, available: {free_gb:.1f}GB)")
             print("🚨 Training requires at least 2GB free VRAM.")
             print("💡 Please close other GPU applications or use a smaller model.")
             exit(1)
+
+        # Ha több GPU van, szorozzuk fel a batch_size-t és lr_multiplier-t
+        if gpu_count > 1:
+            print(f"🔢 Multi-GPU detected: {gpu_count} GPUs. Scaling batch size and LR multiplier.")
+            batch_config['batch_size'] *= gpu_count
+            batch_config['lr_multiplier'] *= gpu_count * 0.9  # LR-t óvatosabban növeljük
+            batch_config['optimization_level'] += f"_MULTIGPUx{gpu_count}"
+            print(f"   🧩 Scaled batch size: {batch_config['batch_size']}, LR multiplier: {batch_config['lr_multiplier']:.2f}")
         
         # Memória foglaltság alapú finomhangolás
         memory_usage_ratio = allocated_memory / total_memory
@@ -550,7 +552,6 @@ if __name__ == "__main__":
     print("✅ Loaded dataset:")
     print(f"   📊 Positions: {len(fen_move_score_vec):,}")
     print(f"   🤖 Source: {info.get('source', 'Unknown')}")
-    print(f"   🎮 Data mix: {info.get('data_mix', 'Unknown composition')}")
     print(f"   🖥️ GPU Optimized: {info.get('gpu_optimized', False)}")
 
     # --- UCI move vocabulary and binning ---
