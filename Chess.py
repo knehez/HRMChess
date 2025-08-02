@@ -496,21 +496,21 @@ if __name__ == "__main__":
         print(f"\n📝 Dataset not found: {dataset_path}")
         print("📊 Creating new dataset...")
         
-        # Ask user for dataset size
+        # Ask user for dataset size (max_positions)
         while True:
             try:
-                max_games = int(input("Enter number of games (number of games, e.g., 20000): "))
-                if max_games > 0:
+                max_positions = int(input("Addja meg a pozíciók számát a tanító adatbázishoz (pl. 20000): "))
+                if max_positions > 0:
                     break
                 else:
-                    print("❌ Please enter a positive number")
+                    print("❌ Kérem pozitív számot adjon meg!")
             except ValueError:
-                print("❌ Please enter a valid integer")
-        
-        print(f"🎯 Creating dataset with {max_games:,} games")
-        
+                print("❌ Kérem érvényes egész számot adjon meg!")
+
+        print(f"🎯 Adatbázis létrehozása {max_positions:,} pozícióval")
+
         # Create dataset from games and puzzles with user-specified size
-        fens, moves = create_dataset_from_games(max_games)
+        fens, moves = create_dataset_from_games(max_positions)
 
         # Save as vector of (fen, move, score) tuples in a .pt file, with metadata
         fen_move_score_vec = []
@@ -530,8 +530,7 @@ if __name__ == "__main__":
                 'total_positions': len(fen_move_score_vec),
                 'stockfish_evaluation': 'all_legal_moves',
                 'evaluation_method': 'all_moves_winpercent',
-                'data_format': '(fen, move, score)',
-                'number_of_games': max_games
+                'data_format': '(fen, move, score)'
             }
         }
         torch.save(dataset_info, output_pt)

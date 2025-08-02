@@ -82,18 +82,17 @@ class HRMChess(nn.Module):
 
         # Value head: bin classification (LayerNorm a fej előtt)
         self.value_head = nn.Sequential(
-            nn.LayerNorm(emb_dim),
             nn.Linear(emb_dim, emb_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(emb_dim, num_bins)
         )
 
         # MLP pooling a teljes szekvenciára (FEN + UCI együtt)
         self.seq_mlp_pool = nn.Sequential(
             nn.Linear(emb_dim, emb_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(emb_dim, emb_dim),
-            nn.ReLU()
+            nn.GELU()
         )
 
     def forward(self, fen_tokens, uci_token, z_init=None):
@@ -227,7 +226,7 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=1e-4, warmup_epochs=
             train_batches += 1
             scheduler.step()
             global_step += 1
-            if i % 1000 == 0 and i > 0:
+            if i % 10000 == 0 and i > 0:
                 current_lr = optimizer.param_groups[0]['lr']
                 warmup_progress = min(1.0, global_step / warmup_steps) * 100
                 print(f"Epoch {epoch}, Step {i}, Total loss: {loss_info['total_loss']:.4f}, "
