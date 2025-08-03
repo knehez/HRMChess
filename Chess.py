@@ -1,4 +1,9 @@
+
 import chess
+import numpy as np
+from hrm_model import fen_to_bitplanes
+
+# --- FEN to bitplane conversion ---
 import chess.pgn
 import numpy as np
 import torch
@@ -55,49 +60,63 @@ def detect_gpu_memory_and_optimize_training():
         print(f"📊 Free VRAM: {free_gb:.1f} GB")
         print(f"🔢 CUDA Devices: {gpu_count}")
         
-        # Batch size optimalizálás SZABAD GPU memória alapján
-        if free_gb >= 20:  # Bőven van szabad hely high-end kártyákon
+        # Batch size optimalizálás SZABAD GPU memória alapján - RTX 4090 optimalizálva
+        if free_gb >= 20:  # RTX 4090 territory - aggressive optimization
             batch_config = {
-                'batch_size': 64,
-                'lr_multiplier': 1.5,  # Nagyobb batch → nagyobb LR
+                'batch_size': 128,  # RTX 4090-re optimalizált nagyobb batch
+                'lr_multiplier': 2.0,  # Nagyobb batch → agresszívebb LR
+                'optimization_level': 'RTX_4090_ULTRA'
+            }
+            print(f"🚀 RTX 4090 ULTRA MODE ({free_gb:.1f}GB+ available)")
+        elif free_gb >= 16:  # RTX 4080/3090 territory  
+            batch_config = {
+                'batch_size': 96,
+                'lr_multiplier': 1.8,
+                'optimization_level': 'HIGH_END_PLUS'
+            }
+            print(f"🔥 HIGH-END PLUS MEMORY ({free_gb:.1f}GB available)")
+        elif free_gb >= 12:  # High-end territory
+            batch_config = {
+                'batch_size': 80,
+                'lr_multiplier': 1.6,
                 'optimization_level': 'HIGH_END_FREE'
             }
-            print(f"🚀 HIGH-END FREE MEMORY ({free_gb:.1f}GB+ available)")
-        elif free_gb >= 14:  # Jó mennyiségű szabad memória
+            print(f"⚡ HIGH-END FREE MEMORY ({free_gb:.1f}GB available)")
+        elif free_gb >= 10:  # Good amount of memory
             batch_config = {
-                'batch_size': 48,
-                'lr_multiplier': 1.3,
+                'batch_size': 64,
+                'lr_multiplier': 1.4,
                 'optimization_level': 'HIGH_FREE'
             }
-            print(f"🔥 HIGH FREE MEMORY ({free_gb:.1f}GB available)")
-        elif free_gb >= 10:  # Közepes szabad memória
+            print(f"� HIGH FREE MEMORY ({free_gb:.1f}GB available)")
+        elif free_gb >= 8:   # Mid-high memory
             batch_config = {
-                'batch_size': 32,
-                'lr_multiplier': 1.1,
+                'batch_size': 48,
+                'lr_multiplier': 1.2,
                 'optimization_level': 'MID_HIGH_FREE'
             }
-            print(f"⚡ MID-HIGH FREE MEMORY ({free_gb:.1f}GB available)")
-        elif free_gb >= 6:   # Átlagos szabad memória
+            print(f"🎯 MID-HIGH FREE MEMORY ({free_gb:.1f}GB available)")
+        elif free_gb >= 6:   # Average memory
             batch_config = {
-                'batch_size': 24,
+                'batch_size': 32,
                 'lr_multiplier': 1.0,
                 'optimization_level': 'MID_FREE'
             }
-            print(f"💪 MID FREE MEMORY ({free_gb:.1f}GB available)")
-        elif free_gb >= 4:   # Kevés szabad memória
+            print(f"� MID FREE MEMORY ({free_gb:.1f}GB available)")
+        elif free_gb >= 4:   # Low-mid memory
             batch_config = {
-                'batch_size': 16,
+                'batch_size': 24,
                 'lr_multiplier': 0.9,
                 'optimization_level': 'LOW_MID_FREE'
             }
-            print(f"🎯 LOW-MID FREE MEMORY ({free_gb:.1f}GB available)")
-        elif free_gb >= 2:   # Nagyon kevés szabad memória
+            print(f"⚠️ LOW-MID FREE MEMORY ({free_gb:.1f}GB available)")
+        elif free_gb >= 2:   # Low memory
             batch_config = {
-                'batch_size': 12,
+                'batch_size': 16,
                 'lr_multiplier': 0.8,
                 'optimization_level': 'LOW_FREE'
             }
-            print(f"⚠️ LOW FREE MEMORY ({free_gb:.1f}GB available)")
+            print(f"🔴 LOW FREE MEMORY ({free_gb:.1f}GB available)")
         else:  # <2GB szabad VRAM
             print(f"❌ Insufficient free GPU memory (<2GB, available: {free_gb:.1f}GB)")
             print("🚨 Training requires at least 2GB free VRAM.")
@@ -120,35 +139,41 @@ def detect_gpu_memory_and_optimize_training():
             batch_config['batch_size'] = max(8, int(batch_config['batch_size'] * 0.7))
             batch_config['lr_multiplier'] *= 0.9
         
-        # Safety check - dynamic memory test
-        print(f"\n🧪 MEMORY SAFETY TEST")
+        # Safety check - dynamic memory test for actual model tensors
+        print("\n🧪 MEMORY SAFETY TEST")
         test_passed = True
         try:
-            # Teszt tensor létrehozása a választott batch size-hoz
+            # Teszt tensor létrehozása a választott batch size-hoz - HRMChess specifikus méretek
             test_batch_size = batch_config['batch_size']
-            test_tensor = torch.randn(test_batch_size, 72, device=device)
-            test_tensor2 = torch.randn(test_batch_size, 64, 64, device=device)
+            # HRMChess model input: [batch_size, 20, 8, 8] bitplanes
+            test_input = torch.randn(test_batch_size, 20, 8, 8, device=device)
+            # Simulate hidden states for HRM reasoning
+            test_hidden = torch.randn(test_batch_size, 256, device=device)  # typical hidden_dim
+            # Simulate conv feature maps
+            test_conv_features = torch.randn(test_batch_size, 128, 8, 8, device=device)
             
             # Memória felhasználás ellenőrzése
             test_memory = torch.cuda.memory_allocated(current_device)
             test_memory_gb = test_memory / (1024**3)
             
             print(f"   ✅ Test batch ({test_batch_size}) allocated: {test_memory_gb:.2f} GB")
+            print(f"   📊 Simulated HRMChess tensors: input[{test_batch_size},20,8,8], hidden[{test_batch_size},256]")
             
             # Cleanup
-            del test_tensor, test_tensor2
+            del test_input, test_hidden, test_conv_features
             torch.cuda.empty_cache()
             
-            # Ha a teszt túl sok memóriát használ, csökkentjük a batch size-t
-            if test_memory_gb > free_gb * 0.6:  # Ha több mint 60% szabad VRAM-ot használná
-                print(f"   ⚠️ Batch size too large for free memory, reducing...")
-                batch_config['batch_size'] = max(8, int(batch_config['batch_size'] * 0.6))
+            # RTX 4090 specifikus threshold - agresszívebb memória használat
+            memory_threshold = 0.75 if free_gb >= 20 else 0.6  # RTX 4090-nál 75%-ig
+            if test_memory_gb > free_gb * memory_threshold:
+                print("   ⚠️ Batch size too large for free memory, reducing...")
+                batch_config['batch_size'] = max(16, int(batch_config['batch_size'] * 0.7))
                 batch_config['lr_multiplier'] *= 0.9
                 
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
-                print(f"   ❌ Memory test failed - reducing batch size")
-                batch_config['batch_size'] = max(8, int(batch_config['batch_size'] * 0.5))
+                print("   ❌ Memory test failed - reducing batch size")
+                batch_config['batch_size'] = max(16, int(batch_config['batch_size'] * 0.6))
                 batch_config['lr_multiplier'] *= 0.8
                 test_passed = False
             torch.cuda.empty_cache()
@@ -426,8 +451,8 @@ def create_dataset_from_games(max_positions=10000):
         pgn_fens = load_pgn_data(
             "./lichess_db_standard_rated_2015-05.pgn",
             max_positions=max_positions,
-            max_moves=30,
-            min_elo=1600
+            max_moves=100,
+            min_elo=1000
         )
         print(f"✅ Loaded {len(pgn_fens):,} positions from PGN")
     except:
@@ -435,21 +460,6 @@ def create_dataset_from_games(max_positions=10000):
         exit(0)
 
     all_fens = pgn_fens
-
-    # Duplikált FEN-ek szűrése indexekkel (memóriahatékony)
-    unique_fen_idx = {}
-    for idx, fen in enumerate(all_fens):
-        if fen not in unique_fen_idx:
-            unique_fen_idx[fen] = idx
-    num_duplicates = len(all_fens) - len(unique_fen_idx)
-    if num_duplicates > 0:
-        print(f"⚠️ Duplikált pozíciók száma: {num_duplicates}")
-    else:
-        print("✅ Nincsenek duplikált pozíciók a PGN adatok között.")
-    
-    # Csak az egyedi pozíciók és policy-k
-    unique_indices = list(unique_fen_idx.values())
-    all_fens = [all_fens[i] for i in unique_indices]
 
     if len(all_fens) == 0:
         print("❌ No training data available!")
@@ -467,207 +477,179 @@ def create_dataset_from_games(max_positions=10000):
     return all_fens, all_move_evals
 
 if __name__ == "__main__":
-    print("🏗️ HRM CHESS MODEL TRAINING")
-    print("="*50)
-    
-    import os
-    import sys
-    print(f"Using device: {device}")
-    
-    # GPU MEMORY DETECTION & OPTIMIZATION
-    if torch.cuda.is_available():
-        gpu_config = detect_gpu_memory_and_optimize_training()
-    else:
-        print("⚠️ CUDA not available - using default CPU training parameters!")
-        gpu_config = {
-            'batch_size': 8,
-            'lr_multiplier': 1.0,
-            'memory_gb': 0,
-            'free_memory_gb': 0,
-            'device_name': 'cpu',
-            'optimization_level': 'CPU_DEFAULT',
-            'memory_test_passed': True
-        }
-    
-    # Load or create dataset
-    dataset_path = "fen_move_score_dataset.pt"
-    
-    if not os.path.exists(dataset_path):
-        print(f"\n📝 Dataset not found: {dataset_path}")
-        print("📊 Creating new dataset...")
-        
-        # Ask user for dataset size (max_positions)
-        while True:
-            try:
-                max_positions = int(input("Addja meg a pozíciók számát a tanító adatbázishoz (pl. 20000): "))
-                if max_positions > 0:
-                    break
-                else:
-                    print("❌ Kérem pozitív számot adjon meg!")
-            except ValueError:
-                print("❌ Kérem érvényes egész számot adjon meg!")
-
-        print(f"🎯 Adatbázis létrehozása {max_positions:,} pozícióval")
-
-        # Create dataset from games and puzzles with user-specified size
-        fens, moves = create_dataset_from_games(max_positions)
-
-        # Save as vector of (fen, move, score) tuples in a .pt file, with metadata
-        fen_move_score_vec = []
-        for fen, move_list in zip(fens, moves):
-            for move_tuple in move_list:
-                move, score = move_tuple
-                fen_move_score_vec.append((fen, move, score))
-                
-        output_pt = "fen_move_score_dataset.pt"
-        
-        dataset_info = {
-            'data': fen_move_score_vec,
-            'info': {
-                'created': time.time(),
-                'source': 'PGN + Stockfish (all legal moves, deduped FENs)',
-                'base_positions': len(fens),
-                'total_positions': len(fen_move_score_vec),
-                'stockfish_evaluation': 'all_legal_moves',
-                'evaluation_method': 'all_moves_winpercent',
-                'data_format': '(fen, move, score)'
+    try:
+        print("🏗️ HRM CHESS MODEL TRAINING")
+        print("="*50)
+        import os
+        import sys
+        print(f"Using device: {device}")
+        # GPU MEMORY DETECTION & OPTIMIZATION
+        if torch.cuda.is_available():
+            gpu_config = detect_gpu_memory_and_optimize_training()
+        else:
+            print("⚠️ CUDA not available - using default CPU training parameters!")
+            gpu_config = {
+                'batch_size': 8,
+                'lr_multiplier': 1.0,
+                'memory_gb': 0,
+                'free_memory_gb': 0,
+                'device_name': 'cpu',
+                'optimization_level': 'CPU_DEFAULT',
+                'memory_test_passed': True
+            }
+        # Load or create dataset
+        dataset_path = "fen_move_score_dataset.pt"
+        if not os.path.exists(dataset_path):
+            print(f"\n📝 Dataset not found: {dataset_path}")
+            print("📊 Creating new dataset...")
+            # Ask user for dataset size (max_positions)
+            while True:
+                try:
+                    max_positions = int(input("Addja meg a pozíciók számát a tanító adatbázishoz (pl. 20000): "))
+                    if max_positions > 0:
+                        break
+                    else:
+                        print("❌ Kérem pozitív számot adjon meg!")
+                except ValueError:
+                    print("❌ Kérem érvényes egész számot adjon meg!")
+            print(f"🎯 Adatbázis létrehozása {max_positions:,} pozícióval")
+            # Create dataset from games and puzzles with user-specified size
+            fens, moves = create_dataset_from_games(max_positions)
+            # Save as vector of (resulting_fen, score) tuples in a .pt file, with metadata
+            from tqdm import tqdm
+            fen_move_score_vec = []
+            for fen, move_list in tqdm(zip(fens, moves), total=len(fens), desc="Processing positions"):
+                board = chess.Board(fen)
+                for move_tuple in move_list:
+                    move, score = move_tuple
+                    try:
+                        board.push(chess.Move.from_uci(move))
+                        resulting_fen = board.fen()
+                        fen_move_score_vec.append((resulting_fen, score))
+                        board.pop()
+                    except Exception as e:
+                        # Skip illegal moves or errors
+                        print(f"[DEBUG] Skipped: {fen} - {move} (error: {e})")
+                        continue
+            # Deduplicate fen_move_score_vec by FEN
+            print("\n🧹 Deduplicating fen_move_score_vec by FEN...")
+            unique_fen_score = {}
+            for fen, score in fen_move_score_vec:
+                if fen not in unique_fen_score:
+                    unique_fen_score[fen] = score
+            num_duplicates = len(fen_move_score_vec) - len(unique_fen_score)
+            fen_move_score_vec = [(fen, score) for fen, score in unique_fen_score.items()]
+            print(f"✅ Deduplicated: {len(fen_move_score_vec):,} unique positions, removed {num_duplicates:,} duplicates.")
+            output_pt = "fen_move_score_dataset.pt"
+            dataset_info = {
+                'data': fen_move_score_vec,
+                'info': {
+                    'created': time.time(),
+                    'source': 'PGN + Stockfish (all legal moves, deduped FENs)',
+                    'base_positions': len(fens),
+                    'total_positions': len(fen_move_score_vec),
+                    'stockfish_evaluation': 'all_legal_moves',
+                    'evaluation_method': 'all_moves_winpercent',
+                    'data_format': '(fen, move, score)'
+                }
+            }
+            torch.save(dataset_info, output_pt)
+            print(f"✅ Saved {len(fen_move_score_vec):,} (fen + move, score) pairs and metadata to {output_pt}")
+            # Use the created data
+            data = dataset_info
+        else:
+            # Load existing dataset
+            print(f"\n📥 Loading existing dataset: {dataset_path}")
+            data = torch.load(dataset_path, weights_only=False)
+        # Extract (fen + move, score) tuples from dataset_info
+        dataset_info = data if 'data' in data else data.get('dataset_info', {})
+        fen_move_score_vec = dataset_info['data']
+        info = dataset_info['info']
+        print("✅ Loaded dataset:")
+        print(f"   📊 Positions: {len(fen_move_score_vec):,}")
+        print(f"   🤖 Source: {info.get('source', 'Unknown')}")
+        print(f"   🖥️ GPU Optimized: {info.get('gpu_optimized', False)}")
+        num_bins = 128  # should match model
+        dataset_size = len(fen_move_score_vec)
+        print(f"\n📊 Dataset size: {dataset_size:,} positions")
+        # MANUAL PARAMETERS
+        hidden_dim, N, T = get_manual_parameters()
+        # Apply GPU optimizations
+        batch_size = gpu_config['batch_size']
+        lr = 1e-4 * gpu_config['lr_multiplier']
+        model_size = f"GPU_MANUAL-{N}x{T}-{gpu_config['optimization_level']}"
+        print("\n🔧 GPU OPTIMIZATIONS APPLIED:")
+        print(f"   📊 Batch Size: {batch_size} (GPU-optimized)")
+        print(f"   📈 Learning Rate: {lr:.6f} (base: 2e-4 × {gpu_config['lr_multiplier']:.2f})")
+        print(f"   🖥️ GPU Level: {gpu_config['optimization_level']}")
+        # HRM modell létrehozása optimalizált paraméterekkel, több GPU támogatással
+        model = HRMChess(hidden_dim=hidden_dim, N=N, T=T).to(device)
+        if torch.cuda.device_count() > 1:
+            print(f"🔗 Using {torch.cuda.device_count()} GPUs (DataParallel)")
+            model = torch.nn.DataParallel(model)
+        # Model info
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        hrm_steps = N * T
+        print("\n🏗️ MODEL ARCHITECTURE:")
+        print(f"📊 Total parameters: {total_params:,}")
+        print(f"📊 Trainable parameters: {trainable_params:,}")
+        print(f"🔄 HRM reasoning steps: {hrm_steps} (N={N} × T={T})")
+        # GPU-optimized training configuration
+        epochs = 30  # Több epoch a jobb konvergenciáért
+        print("\n⚙️ GPU-OPTIMIZED TRAINING CONFIGURATION:")
+        print(f"   • Model: {model_size}")
+        print(f"   • Batch size: {batch_size} (GPU-optimized)")
+        print(f"   • Learning rate: {lr:.6f} (GPU-scaled)")
+        print("   • Warmup epochs: 3 (linear warmup + cosine annealing)")
+        print(f"   • Total epochs: {epochs}")
+        print(f"   • HRM steps: {N}×{T}={N*T}")
+        print(f"   • Parameters: {total_params:,}")
+        print(f"   • Dataset: {dataset_size:,} positions")
+        print(f"   🖥️ GPU: {gpu_config['device_name']} ({gpu_config['memory_gb']:.1f} GB)")
+        print(f"   🏷️ Optimization Level: {gpu_config['optimization_level']}" )
+        # Create value bin dataset (on-the-fly bitplane/bin generation)
+        fen_list = [fen for fen, score in fen_move_score_vec]
+        score_list = [score for fen, score in fen_move_score_vec]
+        dataset = ValueBinDataset(fen_list, score_list, num_bins=num_bins)
+        print(f"\n📊 Dataset: {len(dataset):,} positions")
+        print("🚀 Starting GPU-optimized HRM training with warmup...")
+        # Train with GPU-optimized parameters and warmup
+        train_loop(model, dataset, epochs=epochs, batch_size=batch_size, lr=lr, warmup_epochs=3, device=device)
+        # Save final model with hyperparameters and GPU info
+        # DataParallel esetén a .module.state_dict()-et kell menteni
+        if isinstance(model, torch.nn.DataParallel):
+            state_dict = model.module.state_dict()
+        else:
+            state_dict = model.state_dict()
+        final_checkpoint = {
+            'model_state_dict': state_dict,
+            'hyperparams': {
+                'hidden_dim': hidden_dim,
+                'N': N,
+                'T': T,
+                'input_dim': 20
+            },
+            'training_info': {
+                'epochs': epochs,
+                'batch_size': batch_size,
+                'lr': lr,
+                'warmup_epochs': 3,
+                'dataset_size': len(dataset),
+                'total_params': total_params,
+                'training_mode': 'policy_value_warmup',
+                'gpu_optimized': True,
+                'gpu_config': gpu_config
             }
         }
-        torch.save(dataset_info, output_pt)
-        print(f"✅ Saved {len(fen_move_score_vec):,} (fen + move, score) pairs and metadata to {output_pt}")
-        
-        # Use the created data
-        data = dataset_info
-    else:
-        # Load existing dataset
-        print(f"\n📥 Loading existing dataset: {dataset_path}")
-        data = torch.load(dataset_path, weights_only=False)
-    
-    # Extract (fen + move, score) tuples from dataset_info
-    dataset_info = data if 'data' in data else data.get('dataset_info', {})
-    fen_move_score_vec = dataset_info['data']
-    info = dataset_info['info']
-
-    print("✅ Loaded dataset:")
-    print(f"   📊 Positions: {len(fen_move_score_vec):,}")
-    print(f"   🤖 Source: {info.get('source', 'Unknown')}")
-    print(f"   🖥️ GPU Optimized: {info.get('gpu_optimized', False)}")
-
-    # --- UCI move vocabulary and binning ---
-    from hrm_model import generate_all_possible_uci_moves, score_to_bin
-    uci_vocab = generate_all_possible_uci_moves()
-    uci2idx = {uci: i for i, uci in enumerate(uci_vocab)}
-    num_bins = 128  # should match model
-
-    fen_tokens = []
-    uci_tokens = []
-    target_bins = []
-    debug_prints = 0
-    for fen, move, score in fen_move_score_vec:
-        fen_ascii = [ord(c) for c in fen.ljust(77)[:77]]
-        uci_idx = uci2idx.get(move)
-        if uci_idx is None:
-            if debug_prints < 10:
-                print(f"[DEBUG] Skipped: move not in uci2idx: {move}")
-                debug_prints += 1
-            continue
-        try:
-            bin_idx = score_to_bin(float(score), num_bins=num_bins)
-        except Exception as e:
-            if debug_prints < 10:
-                print(f"[DEBUG] Skipped: score conversion error: {score}, error: {e}")
-                debug_prints += 1
-            continue
-        fen_tokens.append(fen_ascii)
-        uci_tokens.append([uci_idx])
-        target_bins.append(bin_idx)
-
-    dataset_size = len(fen_tokens)
-    print(f"\n📊 Dataset size: {dataset_size:,} positions")
-    
-    # MANUAL PARAMETERS
-    hidden_dim, N, T = get_manual_parameters()
-    
-    # Apply GPU optimizations
-    batch_size = gpu_config['batch_size']
-    lr = 1e-5 * gpu_config['lr_multiplier']
-    model_size = f"GPU_MANUAL-{N}x{T}-{gpu_config['optimization_level']}"
-    
-    print("\n🔧 GPU OPTIMIZATIONS APPLIED:")
-    print(f"   📊 Batch Size: {batch_size} (GPU-optimized)")
-    print(f"   📈 Learning Rate: {lr:.6f} (base: 2e-4 × {gpu_config['lr_multiplier']:.2f})")
-    print(f"   🖥️ GPU Level: {gpu_config['optimization_level']}")
-    
-    # HRM modell létrehozása optimalizált paraméterekkel, több GPU támogatással
-    model = HRMChess(emb_dim=hidden_dim, N=N, T=T).to(device)
-    if torch.cuda.device_count() > 1:
-        print(f"🔗 Using {torch.cuda.device_count()} GPUs (DataParallel)")
-        model = torch.nn.DataParallel(model)
-    
-    # Model info
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    hrm_steps = N * T
-    
-    print("\n🏗️ MODEL ARCHITECTURE:")
-    print(f"📊 Total parameters: {total_params:,}")
-    print(f"📊 Trainable parameters: {trainable_params:,}")
-    print(f"🔄 HRM reasoning steps: {hrm_steps} (N={N} × T={T})")
-    
-    # GPU-optimized training configuration
-    epochs = 30  # Több epoch a jobb konvergenciáért
-    
-    print("\n⚙️ GPU-OPTIMIZED TRAINING CONFIGURATION:")
-    print(f"   • Model: {model_size}")
-    print(f"   • Batch size: {batch_size} (GPU-optimized)")
-    print(f"   • Learning rate: {lr:.6f} (GPU-scaled)")
-    print("   • Warmup epochs: 3 (linear warmup + cosine annealing)")
-    print(f"   • Total epochs: {epochs}")
-    print(f"   • HRM steps: {N}×{T}={N*T}")
-    print(f"   • Parameters: {total_params:,}")
-    print(f"   • Dataset: {dataset_size:,} positions")
-    print(f"   🖥️ GPU: {gpu_config['device_name']} ({gpu_config['memory_gb']:.1f} GB)")
-    print(f"   🏷️ Optimization Level: {gpu_config['optimization_level']}")
-    
-    # Create value bin dataset
-    dataset = ValueBinDataset(fen_tokens, uci_tokens, target_bins)
-    print(f"\n📊 Dataset: {len(dataset):,} positions")
-    print("🚀 Starting GPU-optimized HRM training with warmup...")
-    
-    # Train with GPU-optimized parameters and warmup
-    train_loop(model, dataset, epochs=epochs, batch_size=batch_size, lr=lr, warmup_epochs=3, device=device)
-    
-    # Save final model with hyperparameters and GPU info
-    # DataParallel esetén a .module.state_dict()-et kell menteni
-    if isinstance(model, torch.nn.DataParallel):
-        state_dict = model.module.state_dict()
-    else:
-        state_dict = model.state_dict()
-    final_checkpoint = {
-        'model_state_dict': state_dict,
-        'hyperparams': {
-            'hidden_dim': hidden_dim,
-            'N': N,
-            'T': T,
-            'input_dim': 20
-        },
-        'training_info': {
-            'epochs': epochs,
-            'batch_size': batch_size,
-            'lr': lr,
-            'warmup_epochs': 3,
-            'dataset_size': len(dataset),
-            'total_params': total_params,
-            'training_mode': 'policy_value_warmup',
-            'gpu_optimized': True,
-            'gpu_config': gpu_config
-        }
-    }
-    model_path = "hrm_chess_model.pt"
-    torch.save(final_checkpoint, model_path)
-    print("\n✅ Training completed!")
-    print(f"💾 Model saved to: {model_path}")
-    print(f"🏆 HRM (N={N}, T={T}, hidden_dim={hidden_dim}) with {total_params:,} parameters")
-    print(f"📊 Trained on {len(dataset):,} positions with Warmup mode")
-    print("🎮 Dataset: Balanced PGN games + tactical puzzles for enhanced gameplay")
-    print("🔥 Warmup: 3 epochs with linear warmup + cosine annealing")
+        model_path = "hrm_chess_model.pt"
+        torch.save(final_checkpoint, model_path)
+        print("\n✅ Training completed!")
+        print(f"💾 Model saved to: {model_path}")
+        print(f"🏆 HRM (N={N}, T={T}, hidden_dim={hidden_dim}) with {total_params:,} parameters")
+        print(f"📊 Trained on {len(dataset):,} positions with Warmup mode")
+        print("🎮 Dataset: Balanced PGN games + tactical puzzles for enhanced gameplay")
+        print("🔥 Warmup: 3 epochs with linear warmup + cosine annealing")
+    except KeyboardInterrupt:
+        import sys
+        sys.exit(0)

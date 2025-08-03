@@ -2,13 +2,52 @@
 HRM Chess Model - Hierarchical Reasoning Machine for Chess
 Konvolúciós HRM implementáció
 """
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 from tqdm import tqdm
 import chess
+import numpy as np
+
+# --- FEN to bitplane conversion ---
+def fen_to_bitplanes(fen: str) -> np.ndarray:
+    """
+    Converts a FEN string to a [20, 8, 8] bitplane numpy array.
+    Bitplanes: 12 for piece types, 4 for castling, 1 for side, 1 for ep, 1 for halfmove, 1 for fullmove.
+    """
+    board = chess.Board(fen)
+    bitplanes = np.zeros((20, 8, 8), dtype=np.float32)
+    # Piece bitplanes
+    piece_map = {
+        'P': 0, 'N': 1, 'B': 2, 'R': 3, 'Q': 4, 'K': 5,
+        'p': 6, 'n': 7, 'b': 8, 'r': 9, 'q': 10, 'k': 11
+    }
+    for square in chess.SQUARES:
+        piece = board.piece_at(square)
+        if piece:
+            idx = piece_map[piece.symbol()]
+            row, col = divmod(square, 8)
+            bitplanes[idx, row, col] = 1.0
+    # Castling rights
+    castling = [board.has_kingside_castling_rights(chess.WHITE),
+                board.has_queenside_castling_rights(chess.WHITE),
+                board.has_kingside_castling_rights(chess.BLACK),
+                board.has_queenside_castling_rights(chess.BLACK)]
+    for i, flag in enumerate(castling):
+        bitplanes[12 + i, :, :] = float(flag)
+    # Side to move
+    bitplanes[16, :, :] = float(board.turn)
+    # En passant
+    bitplanes[17, :, :] = 0.0
+    if board.ep_square is not None:
+        row, col = divmod(board.ep_square, 8)
+        bitplanes[17, row, col] = 1.0
+    # Halfmove clock
+    bitplanes[18, :, :] = board.halfmove_clock / 100.0
+    # Fullmove number
+    bitplanes[19, :, :] = board.fullmove_number / 100.0
+    return bitplanes
 
 def fen_to_tokens(fen: str) -> list:
     """
@@ -18,146 +57,113 @@ def fen_to_tokens(fen: str) -> list:
 
 # Dataset for value bin classification: (fen_tokens, uci_token, target_bin)
 class ValueBinDataset(torch.utils.data.Dataset):
-    """Dataset for (fen_tokens, uci_token, target_bin) tuples"""
-    def __init__(self, fen_tokens, uci_tokens, target_bins):
-        self.fen_tokens = torch.as_tensor(fen_tokens).long()
-        self.uci_tokens = torch.as_tensor(uci_tokens).long()
-        self.target_bins = torch.as_tensor(target_bins).long()
+    """Dataset for (fen, score) tuples, generates bitplane tensor and bin index on-the-fly."""
+    def __init__(self, fen_list, score_list, num_bins=128):
+        self.fen_list = fen_list
+        self.score_list = score_list
+        self.num_bins = num_bins
 
     def __len__(self):
-        return len(self.fen_tokens)
+        return len(self.fen_list)
 
     def __getitem__(self, idx):
-        return (
-            self.fen_tokens[idx],           # [77]
-            self.uci_tokens[idx],           # [1] or scalar
-            self.target_bins[idx]           # int (bin label)
-        )
+        fen = self.fen_list[idx]
+        score = self.score_list[idx]
+        bitplanes = torch.tensor(fen_to_bitplanes(fen), dtype=torch.float32)
+        bin_idx = score_to_bin(float(score), num_bins=self.num_bins)
+        bin_idx_tensor = torch.tensor(bin_idx, dtype=torch.long)
+        return bitplanes, bin_idx_tensor
 
 
 class HRMChess(nn.Module):
-    def __init__(self, vocab_size=128, uci_vocab_size=1968, num_bins=128, emb_dim=256, nhead=4, num_layers=4, N=8, T=8):
+    def __init__(self, num_bins=128, hidden_dim=256, N=8, T=8):
         super().__init__()
         self.N = N
         self.T = T
-        self.hidden_dim = emb_dim
-        self.seq_len = 78  # 77 FEN + 1 UCI
-
-        # FEN karakter embedding (ASCII 0–127)
-        self.fen_emb = nn.Embedding(vocab_size, emb_dim)
-        # UCI lépés embedding (indexelt)
-        self.uci_emb = nn.Embedding(uci_vocab_size, emb_dim)
-        # Pozíció embedding
-        self.pos_embedding = nn.Embedding(self.seq_len, emb_dim)
-
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=emb_dim, nhead=nhead, batch_first=True
+        self.hidden_dim = hidden_dim
+        self.num_bitplanes = 20
+        self.board_size = 8
+        # 2D convolutional feature extractor (3 layers, decreasing channels)
+        self.conv = nn.Sequential(
+            nn.Conv2d(self.num_bitplanes, hidden_dim, kernel_size=3, padding=1),  # [B, 20, 8, 8] -> [B, hidden_dim, 8, 8]
+            nn.ReLU(),  # [B, hidden_dim, 8, 8]
+            nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=3, padding=1),  # [B, hidden_dim, 8, 8] -> [B, hidden_dim//2, 8, 8]
+            nn.ReLU(),  # [B, hidden_dim//2, 8, 8]
+            nn.Conv2d(hidden_dim // 2, hidden_dim // 4, kernel_size=3, padding=1),  # [B, hidden_dim//2, 8, 8] -> [B, hidden_dim//4, 8, 8]
+            nn.ReLU(),  # [B, hidden_dim//4, 8, 8]
+            nn.Flatten()  # [B, hidden_dim//4, 8, 8] -> [B, (hidden_dim//4)*8*8]
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        # LayerNorm a transformer kimenetére
-        self.post_transformer_norm = nn.LayerNorm(emb_dim)
-
-
-        # L_net: Low-level module (zL, zH, transformer_out) -> zL
+        # Board representation enhancer - további reprezentációs rétegek
+        self.board_enhancer = nn.Sequential(
+            nn.Linear((hidden_dim // 4) * 8 * 8, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        # L_net: Low-level module (zL, zH, board_enhanced) -> zL
         self.L_net = nn.Sequential(
-            nn.Linear(emb_dim * 3, emb_dim),
+            nn.Linear(hidden_dim * 3, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(emb_dim, emb_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.LayerNorm(emb_dim)
+            nn.LayerNorm(hidden_dim)
         )
-
         # H_net: High-level module (zH, zL) -> zH
         self.H_net = nn.Sequential(
-            nn.Linear(emb_dim * 2, emb_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(emb_dim, emb_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.LayerNorm(emb_dim)
+            nn.LayerNorm(hidden_dim)
         )
-
-        # Value head: bin classification (LayerNorm a fej előtt)
+        # Value head: bin classification
         self.value_head = nn.Sequential(
-            nn.Linear(emb_dim, emb_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(emb_dim, num_bins)
+            nn.Linear(hidden_dim, num_bins)
         )
 
-        # MLP pooling a teljes szekvenciára (FEN + UCI együtt)
-        self.seq_mlp_pool = nn.Sequential(
-            nn.Linear(emb_dim, emb_dim),
-            nn.GELU(),
-            nn.Linear(emb_dim, emb_dim),
-            nn.GELU()
-        )
-
-    def forward(self, fen_tokens, uci_token, z_init=None):
+    def forward(self, bitplanes, z_init=None):
         """
-        fen_tokens: [B, 77]  (ASCII kódolt FEN karakterek)
-        uci_token:  [B, 1]   (UCI lépés index)
+        bitplanes: [B, 20, 8, 8]  (20 bitplane sakk állás)
         """
-        fen_emb = self.fen_emb(fen_tokens)               # [B, 77, D]
-        uci_emb = self.uci_emb(uci_token).squeeze(1)     # [B, D]
-        uci_emb = uci_emb.unsqueeze(1)                   # [B, 1, D]
-        x = torch.cat([fen_emb, uci_emb], dim=1)         # [B, 78, D]
-
-        # Pozíciókódolás hozzáadása
-        batch_size = x.size(0)
-        positions = torch.arange(0, self.seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
-        pos_emb = self.pos_embedding(positions)          # [B, 78, D]
-        x = x + pos_emb
-
-        # Transformer
-        x = self.transformer(x)                          # [B, 78, D]
-
-        # LayerNorm a transformer kimenetére
-        x = self.post_transformer_norm(x)
-
-        # MLP pooling a teljes szekvenciára (FEN + UCI együtt)
-        mlp_out = self.seq_mlp_pool(x)  # [B, 78, D]
-        seq_agg = mlp_out.mean(dim=1)   # [B, D]
-        out = seq_agg                   # [B, D]
+        batch_size = bitplanes.size(0)
+        # 2D convolutional feature extraction
+        x = self.conv(bitplanes)  # [B, hidden_dim*8*8]
+        board_enhanced = self.board_enhancer(x)  # [B, hidden_dim]
 
         # HRM hierarchical processing: N*T-1 steps without gradient
         if z_init is None:
-            z_H = torch.zeros(batch_size, self.hidden_dim, device=out.device)
-            z_L = torch.zeros(batch_size, self.hidden_dim, device=out.device)
+            z_H = torch.zeros(batch_size, self.hidden_dim, device=x.device)
+            z_L = torch.zeros(batch_size, self.hidden_dim, device=x.device)
         else:
             z_H, z_L = z_init
-        
-        # HRM hierarchical processing: N*T-1 steps without gradient
         total_steps = self.N * self.T
         with torch.no_grad():
             for i in range(total_steps - 1):
-                # L_net: (zL, zH, board_features) -> zL
-                l_input = torch.cat([z_L, z_H, out], dim=-1)  # [B, 3D]
+                l_input = torch.cat([z_L, z_H, board_enhanced], dim=-1)
                 z_L = self.L_net(l_input)
-                
-                # H_net: every T steps, (zH, zL) -> zH
                 if (i + 1) % self.T == 0:
                     h_input = torch.cat([z_H, z_L], dim=-1)
                     z_H = self.H_net(h_input)
         # Final step WITH gradient
-        l_input = torch.cat([z_L, z_H, out], dim=-1)
+        l_input = torch.cat([z_L, z_H, board_enhanced], dim=-1)
         z_L = self.L_net(l_input)
         h_input = torch.cat([z_H, z_L], dim=-1)
         z_H = self.H_net(h_input)
-        # Value prediction from z_H
         value_logits = self.value_head(z_H)  # [B, num_bins]
         return value_logits
 
 def train_step(model, batch, optimizer):
     """
     Training step for value bin classification.
-    batch: (fen_tokens, uci_token, target_bin)
+    batch: (fen_tokens, target_bin)
     """
-    fen_tokens, uci_token, target_bin = batch[:3]
+    fen_tokens, target_bin = batch[:2]
     optimizer.zero_grad()
-    logits = model(fen_tokens, uci_token)
+    logits = model(fen_tokens)
     loss = F.cross_entropy(logits, target_bin)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -171,8 +177,8 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=1e-4, warmup_epochs=
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print(f"\n🏗️ TRAINING LOOP")
-    print(f"   ⚖️ Value bin classification (cross-entropy)")
+    print("\n🏗️ TRAINING LOOP")
+    print("   ⚖️ Value bin classification (cross-entropy)")
     print(f"   🔥 Warmup epochs: {warmup_epochs}")
 
     # Train/validation split
@@ -239,8 +245,8 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=1e-4, warmup_epochs=
         with torch.no_grad():
             for batch in val_dataloader:
                 batch = tuple(b.to(device) for b in batch)
-                fen_tokens, uci_token, target_bin = batch[:3]
-                logits = model(fen_tokens, uci_token)
+                fen_tokens, target_bin = batch[:2]
+                logits = model(fen_tokens)
                 loss = F.cross_entropy(logits, target_bin)
                 val_loss += loss.item()
                 val_batches += 1
@@ -273,8 +279,7 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=1e-4, warmup_epochs=
                 'hyperparams': {
                     'hidden_dim': model.hidden_dim,
                     'N': model.N,
-                    'T': model.T,
-                    'seq_len': model.seq_len
+                    'T': model.T
                 },
                 'training_info': {
                     'epoch': epoch,
@@ -299,68 +304,6 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=1e-4, warmup_epochs=
     print(f"📊 Best validation loss: {best_val_loss:.4f}")
     print(f"🔥 Total training steps: {global_step:,}")
     print(f"🔥 Warmup completed: {min(global_step, warmup_steps):,}/{warmup_steps:,} steps")
-
-def generate_all_possible_uci_moves():
-    """
-    Létrehozza az összes lehetséges (elméletileg létező) UCI lépést.
-    Az UCI lépések formátuma például: e2e4, e7e8q stb.
-    """
-    all_moves = set()
-
-    # Az összes lehetséges táblahely 64 mező: a1–h8
-    squares = [chess.square(file, rank) for file in range(8) for rank in range(8)]
-
-    # Létrehozunk mesterséges állásokat, ahol minden mezőn minden figura lehet
-    piece_types = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
-    colors = [chess.WHITE, chess.BLACK]
-
-    board = chess.Board(None)  # üres tábla
-
-    for color in colors:
-        for piece in piece_types:
-            for from_sq in squares:
-                board.clear_board()
-                board.set_piece_at(from_sq, chess.Piece(piece, color))
-
-                # Legyen egy király is, hogy ne legyen illegális állás
-                king_sq = chess.E1 if color == chess.WHITE else chess.E8
-                if from_sq != king_sq:
-                    board.set_piece_at(king_sq, chess.Piece(chess.KING, color))
-
-                board.turn = color
-                legal_moves = list(board.legal_moves)
-
-                for move in legal_moves:
-                    all_moves.add(move.uci())
-
-    # Explicit: minden lehetséges gyalog-promóciós lépés (a2-a1q, h7-h8n, stb.)
-    files = 'abcdefgh'
-    for color in [chess.WHITE, chess.BLACK]:
-        if color == chess.WHITE:
-            from_rank, to_rank = 6, 7  # 7. sor -> 8. sor
-        else:
-            from_rank, to_rank = 1, 0  # 2. sor -> 1. sor
-        for file in range(8):
-            from_sq = files[file] + str(from_rank+1)
-            to_sq = files[file] + str(to_rank+1)
-            for promo in 'qrbn':
-                # sima előrelépés promócióval
-                all_moves.add(f"{from_sq}{to_sq}{promo}")
-            # ütés balra
-            if file > 0:
-                from_sq_left = files[file] + str(from_rank+1)
-                to_sq_left = files[file-1] + str(to_rank+1)
-                for promo in 'qrbn':
-                    all_moves.add(f"{from_sq_left}{to_sq_left}{promo}")
-            # ütés jobbra
-            if file < 7:
-                from_sq_right = files[file] + str(from_rank+1)
-                to_sq_right = files[file+1] + str(to_rank+1)
-                for promo in 'qrbn':
-                    all_moves.add(f"{from_sq_right}{to_sq_right}{promo}")
-
-    # Végül rendezzük, hogy stabil tokenizálás legyen
-    return sorted(all_moves)
 
 def score_to_bin(score: float, num_bins: int = 128) -> int:
     """
