@@ -17,7 +17,6 @@ class ELORatingSystem:
     def __init__(self, model_path=None):
         """ELO mérési rendszer inicializálása - transformer-alapú HRM modellhez"""
         import sys
-        from hrm_model import generate_all_possible_uci_moves
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if model_path is None:
             model_path = self._select_model()
@@ -36,13 +35,13 @@ class ELORatingSystem:
                 emb_dim = 128
                 N = 4
                 T = 4
-            self.model = HRMChess(emb_dim=emb_dim, N=N, T=T).to(self.device)
+            self.model = HRMChess(hidden_dim=emb_dim, N=N, T=T).to(self.device)
             self.model_type = f"Transformer-HRM-{emb_dim}-N{N}-T{T}"
-            print(f"🏗️ Created transformer HRM model: emb_dim={emb_dim}, N={N}, T={T}")
+            print(f"🏗️ Created transformer HRM model: hidden_dim={emb_dim}, N={N}, T={T}")
         except Exception as e:
             print(f"⚠️ Error detecting model parameters: {e}")
             print("🔧 Creating default transformer HRM model...")
-            self.model = HRMChess(emb_dim=128, N=4, T=4).to(self.device)
+            self.model = HRMChess(hidden_dim=128, N=4, T=4).to(self.device)
             self.model_type = "Default-Transformer-HRM-128"
         # Load model weights
         if os.path.exists(self.model_path):
@@ -73,9 +72,9 @@ class ELORatingSystem:
             print("🔄 Using randomly initialized model for testing...")
         self.model.eval()
         self.games_played = []
-        # UCI move vocab for move tokenization
-        self.uci_move_list = generate_all_possible_uci_moves()
-        self.uci_move_to_idx = {uci: i for i, uci in enumerate(self.uci_move_list)}
+        # Always initialize move index attributes to avoid AttributeError
+        self.uci_move_list = []
+        self.uci_move_to_idx = {}
     
     def _select_model(self):
         """Modell kiválasztása a felhasználó által"""
@@ -193,50 +192,33 @@ class ELORatingSystem:
         return hidden_dim, N, T
         
     def model_move(self, board, temperature=0.7, debug=False):
-        """Transformer HRM modell lépés választás (value bin head alapján, FEN+move token input, batch)"""
+        """Lépés választás: minden lehetséges lépés utáni állást batch-ben kiértékel, a legjobb értékelést választja."""
         import torch
         from hrm_model import fen_to_tokens, bin_to_score
-        fen = board.fen()
         legal_moves = list(board.legal_moves)
         if not legal_moves:
             raise ValueError("No legal moves available.")
-        # Prepare batch tokens
-        fen_tokens = torch.tensor([fen_to_tokens(fen)], dtype=torch.long).repeat(len(legal_moves), 1).to(self.device)  # [num_moves, 77]
-        uci_indices = []
-        valid_indices = []
-        missing_moves = []
-        for i, move in enumerate(legal_moves):
-            uci = move.uci()
-            idx = self.uci_move_to_idx.get(uci, None)
-            if idx is not None:
-                uci_indices.append(idx)
-                valid_indices.append(i)
-            else:
-                uci_indices.append(-1)  # Placeholder for invalid
-                missing_moves.append(uci)
-        if missing_moves:
-            print(f"⚠️ Warning: {len(missing_moves)} legal moves missing from uci_move_to_idx: {missing_moves}")
-        # Mask for valid moves
-        valid_mask = torch.tensor([i != -1 for i in uci_indices], dtype=torch.bool)
-        uci_tensor = torch.tensor([i if i != -1 else 0 for i in uci_indices], dtype=torch.long).to(self.device)  # [num_moves]
+        # Generáljuk az összes lehetséges következő FEN-t
+        next_fens = []
+        for move in legal_moves:
+            board_copy = board.copy()
+            board_copy.push(move)
+            next_fens.append(board_copy.fen())
+        # Bitplane-re alakítjuk az összes FEN-t (gyorsabb, numpy array-ből tensor)
+        from hrm_model import fen_to_bitplanes
+        import numpy as np
+        bitplane_np = np.array([fen_to_bitplanes(fen) for fen in next_fens], dtype=np.float32)  # [num_moves, 20, 8, 8]
+        bitplane_batch = torch.from_numpy(bitplane_np).to(self.device)
         move_scores = np.full(len(legal_moves), -float('inf'), dtype=np.float32)
         move_info = []
         with torch.no_grad():
-            # Only evaluate valid moves
-            if valid_mask.any():
-                fen_tokens_valid = fen_tokens[valid_mask]
-                uci_tensor_valid = uci_tensor[valid_mask]
-                out = self.model(fen_tokens_valid, uci_tensor_valid)  # [num_valid, num_bins]
-                for j, logits in enumerate(out):
-                    value_probs = torch.softmax(logits / temperature, dim=0)
-                    expected_bin = (value_probs * torch.arange(len(value_probs), device=value_probs.device)).sum().item()
-                    win_percent = bin_to_score(expected_bin, num_bins=len(value_probs))
-                    move_scores[valid_indices[j]] = win_percent
-                    move_info.append((legal_moves[valid_indices[j]], win_percent))
-            # For invalid moves, keep -inf
-            for i, idx in enumerate(uci_indices):
-                if idx == -1:
-                    move_info.append((legal_moves[i], -float('inf')))
+            out = self.model(bitplane_batch)  # [num_moves, num_bins]
+            for i, logits in enumerate(out):
+                value_probs = torch.softmax(logits / temperature, dim=0)
+                expected_bin = (value_probs * torch.arange(len(value_probs), device=value_probs.device)).sum().item()
+                win_percent = bin_to_score(expected_bin, num_bins=len(value_probs))
+                move_scores[i] = win_percent
+                move_info.append((legal_moves[i], win_percent))
         selected_idx = int(np.argmax(move_scores))
         selected_move = legal_moves[selected_idx]
         move_confidence = move_scores[selected_idx]
@@ -436,57 +418,21 @@ class ELORatingSystem:
     def puzzle_rating(self, puzzle_file=None):
         """Továbbfejlesztett taktikai puzzle elemzés debug információkkal"""
         print("\n🧩 TACTICAL PUZZLE RATING:")
-        
-        # Enhanced puzzle set with easier tactical problems
-        puzzles = [
-            # Easy (1000–1200 ELO) - back rank mate idea
-            {
-                "fen": "6k1/3r1ppp/1pR1p3/1p1pP3/rP6/5PP1/4P1KP/1R6 b - - 2 26",
-                "solution": ["d5d4", "c6c8", "d7d8", "c8d8"],
-                "description": "backRankMate endgame mate",
-                "difficulty": "Easy",
-                "rating": 1040
-            },
-            # Medium (1200–1400 ELO) - discovered attack
-            {
-                "fen": "r2q1r1k/ppp3pp/2nb4/3Q1b2/8/6N1/PPP1NPPP/R1B2RK1 w - - 1 14",
-                "solution": ["g3f5", "d6h2", "g1h2", "d8d5"],
-                "description": "advantage discoveredAttack kingsideAttack",
-                "difficulty": "Medium",
-                "rating": 1211
-            },
-            # Very Hard (1600+ ELO) - long mate sequence
-            {
-                "fen": "5b1k/4n1np/6p1/4Q3/3BP3/3b1P2/3q2PP/R5K1 b - - 4 29",
-                "solution": ["e7c6", "e5g7", "f8g7", "a1a8", "c6b8", "a8b8"],
-                "description": "long mate mateIn3",
-                "difficulty": "Very Hard",
-                "rating": 1677
-            },
-            # Hard (1400–1600 ELO) - deflection tactic
-            {
-                "fen": "8/3R4/7p/4K3/2BpP3/2kP2Pr/8/3b4 w - - 3 46",
-                "solution": ["d7d4", "h3h5", "e5f6", "c3d4"],
-                "description": "advantage deflection endgame",
-                "difficulty": "Hard",
-                "rating": 1402
-            },
-            # Hard (1400–1600 ELO) - advanced pawn and sacrifice
-            {
-                "fen": "8/p7/1P1k3p/P4pp1/2K5/8/5n2/7B b - - 0 39",
-                "solution": ["a7b6", "a5a6", "f2h1", "a6a7"],
-                "description": "advancedPawn advantage endgame",
-                "difficulty": "Hard",
-                "rating": 1509
-            }
-        ]
+        # Mindig puzzles.json-ből töltjük be
+        try:
+            with open("puzzles.json", "r", encoding="utf-8") as f:
+                puzzles = json.load(f)
+            print(f"✅ Loaded {len(puzzles)} puzzles from puzzles.json")
+        except Exception as e:
+            print(f"❌ Error loading puzzles.json: {e}")
+            puzzles = []
         
         solved = 0
         total_rating = 0
         detailed_results = []
         
         for i, puzzle in enumerate(puzzles):
-            print(f"\n🧩 Puzzle {i+1}: {puzzle['description']} ({puzzle['difficulty']} - {puzzle['rating']} ELO)")
+            print(f"\n🧩 Puzzle {i+1}: 1{puzzle['rating']} ELO)")
             board = chess.Board(puzzle["fen"])
             print(f"Position: {puzzle['fen']}")
             
@@ -504,8 +450,6 @@ class ELORatingSystem:
                 status = "❌ FAILED"
             
             detailed_results.append({
-                'puzzle': puzzle['description'],
-                'difficulty': puzzle['difficulty'], 
                 'rating': puzzle['rating'],
                 'model_move': str(best_move),
                 'confidence': confidence,

@@ -13,24 +13,24 @@ def test_model_move():
     # A model_move debug=True esetén kiírja a top 3-at, de itt explicit újra lekérjük
     # Újra meghívjuk, hogy move_info_sorted-ot is elérjük
     import torch
-    from hrm_model import fen_to_tokens, bin_to_score
+    from hrm_model import fen_to_bitplanes, bin_to_score
     legal_moves = list(board.legal_moves)
-    fen_tokens = torch.tensor([fen_to_tokens(board.fen())], dtype=torch.long).repeat(len(legal_moves), 1).to(elo_system.device)
-    uci_indices = [elo_system.uci_move_to_idx.get(m.uci(), -1) for m in legal_moves]
-    valid_mask = torch.tensor([i != -1 for i in uci_indices], dtype=torch.bool)
-    uci_tensor = torch.tensor([i if i != -1 else 0 for i in uci_indices], dtype=torch.long).to(elo_system.device)
+    next_fens = []
+    for move in legal_moves:
+        board_copy = board.copy()
+        board_copy.push(move)
+        next_fens.append(board_copy.fen())
+    import numpy as np
+    bitplane_np = np.array([fen_to_bitplanes(fen) for fen in next_fens], dtype=np.float32)
+    bitplane_batch = torch.from_numpy(bitplane_np).to(elo_system.device)
     move_scores = [-float('inf')] * len(legal_moves)
     with torch.no_grad():
-        if valid_mask.any():
-            fen_tokens_valid = fen_tokens[valid_mask]
-            uci_tensor_valid = uci_tensor[valid_mask]
-            out = elo_system.model(fen_tokens_valid, uci_tensor_valid)
-            valid_indices = [i for i, idx in enumerate(uci_indices) if idx != -1]
-            for j, logits in enumerate(out):
-                value_probs = torch.softmax(logits, dim=0)
-                expected_bin = (value_probs * torch.arange(len(value_probs), device=value_probs.device)).sum().item()
-                win_percent = bin_to_score(expected_bin, num_bins=len(value_probs))
-                move_scores[valid_indices[j]] = win_percent
+        out = elo_system.model(bitplane_batch)
+        for i, logits in enumerate(out):
+            value_probs = torch.softmax(logits, dim=0)
+            expected_bin = (value_probs * torch.arange(len(value_probs), device=value_probs.device)).sum().item()
+            win_percent = bin_to_score(expected_bin, num_bins=len(value_probs))
+            move_scores[i] = win_percent
     move_info = list(zip(legal_moves, move_scores))
     move_info_sorted = sorted(move_info, key=lambda x: x[1], reverse=True)
     print(f"Top {k} lépés:")
