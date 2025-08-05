@@ -1,6 +1,6 @@
 """
 HRM Chess Model - Hierarchical Reasoning Machine for Chess
-Konvolúciós HRM implementáció
+Konvolúciós HRM implementáció with Automatic Mixed Precision (float16)
 """
 import torch
 import torch.nn as nn
@@ -175,30 +175,46 @@ class HRMChess(nn.Module):
         logits = self.value_head(z_H)  # [B, num_bins]
         return logits
 
-def train_step(model, batch, optimizer):
+def train_step(model, batch, optimizer, scaler=None, use_amp=True):
     """
-    Training step for value bin classification.
+    Training step for value bin classification with Automatic Mixed Precision.
     batch: (fen_tokens, target_bin)
     """
     fen_tokens, target_bin = batch[:2]
     optimizer.zero_grad()
-    logits = model(fen_tokens)
-    loss = F.cross_entropy(logits, target_bin)
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    optimizer.step()
+    
+    if use_amp and scaler is not None:
+        with torch.amp.autocast('cuda'):
+            logits = model(fen_tokens)
+            loss = F.cross_entropy(logits, target_bin)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        logits = model(fen_tokens)
+        loss = F.cross_entropy(logits, target_bin)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+    
     return {'total_loss': loss.item()}
 
-def train_loop(model, dataset, epochs=25, batch_size=16, lr=1e-4, warmup_epochs=3, device=None):
+def train_loop(model, dataset, epochs=25, batch_size=16, lr=1e-4, warmup_epochs=3, device=None, use_amp=True):
     """
-    Training loop for value bin classification (cross-entropy)
+    Training loop for value bin classification (cross-entropy) with Automatic Mixed Precision
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("\n🏗️ TRAINING LOOP")
     print("   ⚖️ Value bin classification (cross-entropy)")
+    print(f"   🚀 AMP (float16): {'Enabled' if use_amp and device.type == 'cuda' else 'Disabled'}")
     print(f"   🔥 Warmup epochs: {warmup_epochs}")
+
+    # Initialize AMP scaler if using CUDA and AMP
+    scaler = torch.amp.GradScaler('cuda') if use_amp and device.type == 'cuda' else None
 
     # Train/validation split
     train_size = int(0.85 * len(dataset))
@@ -246,7 +262,7 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=1e-4, warmup_epochs=
 
         for i, batch in enumerate(train_dataloader):
             batch = tuple(b.to(device) for b in batch)
-            loss_info = train_step(model, batch, optimizer)
+            loss_info = train_step(model, batch, optimizer, scaler, use_amp)
             train_loss += loss_info['total_loss']
             train_batches += 1
             scheduler.step()
@@ -268,8 +284,13 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=1e-4, warmup_epochs=
             for batch in val_dataloader:
                 batch = tuple(b.to(device) for b in batch)
                 fen_tokens, target_bin = batch[:2]
-                logits = model(fen_tokens)
-                loss = F.cross_entropy(logits, target_bin)
+                if use_amp and device.type == 'cuda':
+                    with torch.amp.autocast('cuda'):
+                        logits = model(fen_tokens)
+                        loss = F.cross_entropy(logits, target_bin)
+                else:
+                    logits = model(fen_tokens)
+                    loss = F.cross_entropy(logits, target_bin)
                 val_loss += loss.item()
                 val_batches += 1
                 # Accuracy számítás
@@ -350,3 +371,99 @@ def bin_to_score(bin_idx: int, num_bins: int = 128) -> float:
     """
     bin_width = 1.0 / num_bins
     return (bin_idx + 0.5) * bin_width
+
+def load_model_with_amp(model_path, device=None, use_half=False):
+    """
+    Load HRMChess model with optional float16 optimization for inference.
+    
+    Args:
+        model_path: Path to the model checkpoint
+        device: Target device (cuda/cpu)
+        use_half: Whether to convert to float16 (only for CUDA)
+    
+    Returns:
+        model: Loaded HRMChess model
+        model_info: Dictionary with model metadata
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load checkpoint
+    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+    
+    # Extract hyperparameters
+    if 'hyperparams' in checkpoint:
+        hyper = checkpoint['hyperparams']
+        hidden_dim = hyper.get('hidden_dim', 256)
+        N = hyper.get('N', 8)
+        T = hyper.get('T', 8)
+        nhead = hyper.get('nhead', 4)
+        dim_feedforward = hyper.get('dim_feedforward', hidden_dim * 2)
+    else:
+        # Default parameters
+        hidden_dim = 256
+        N = 8
+        T = 8
+        nhead = 4
+        dim_feedforward = hidden_dim * 2
+    
+    # Create model
+    model = HRMChess(
+        hidden_dim=hidden_dim, 
+        N=N, 
+        T=T, 
+        nhead=nhead, 
+        dim_feedforward=dim_feedforward
+    )
+    
+    # Load state dict
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+    
+    # Move to device
+    model.to(device)
+    
+    # Convert to half precision if requested and on CUDA
+    if use_half and device.type == 'cuda':
+        model.half()
+        print("🚀 Model converted to float16 for faster inference")
+    
+    model.eval()
+    
+    model_info = {
+        'hidden_dim': hidden_dim,
+        'N': N,
+        'T': T,
+        'nhead': nhead,
+        'dim_feedforward': dim_feedforward,
+        'device': device,
+        'use_half': use_half and device.type == 'cuda'
+    }
+    
+    return model, model_info
+
+def inference_with_amp(model, bitplanes, use_amp=True):
+    """
+    Perform inference with optional AMP acceleration.
+    
+    Args:
+        model: The HRMChess model
+        bitplanes: Input tensor [batch_size, 20, 8, 8]
+        use_amp: Whether to use automatic mixed precision
+    
+    Returns:
+        logits: Model output
+    """
+    device = next(model.parameters()).device
+    bitplanes = bitplanes.to(device)
+    
+    with torch.no_grad():
+        if use_amp and device.type == 'cuda':
+            with torch.amp.autocast('cuda'):
+                logits = model(bitplanes)
+        else:
+            logits = model(bitplanes)
+    
+    return logits

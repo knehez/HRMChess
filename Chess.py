@@ -645,9 +645,9 @@ if __name__ == "__main__":
         score_list = [score for fen, score in fen_move_score_vec]
         dataset = ValueBinDataset(fen_list, score_list, num_bins=num_bins)
         print(f"\n📊 Dataset: {len(dataset):,} positions")
-        print("🚀 Starting GPU-optimized HRM training with warmup...")
-        # Train with GPU-optimized parameters and warmup
-        train_loop(model, dataset, epochs=epochs, batch_size=batch_size, lr=lr, warmup_epochs=3, device=device)
+        print("🚀 Starting GPU-optimized HRM training with warmup and AMP...")
+        # Train with GPU-optimized parameters, warmup, and Automatic Mixed Precision
+        train_loop(model, dataset, epochs=epochs, batch_size=batch_size, lr=lr, warmup_epochs=3, device=device, use_amp=True)
         # Save final model with hyperparameters and GPU info
         # DataParallel esetén a .module.state_dict()-et kell menteni
         if isinstance(model, torch.nn.DataParallel):

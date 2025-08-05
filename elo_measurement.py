@@ -1,5 +1,5 @@
 """
-Convolutional HRM Chess Model ELO Rating Measurement System
+Convolutional HRM Chess Model ELO Rating
 """
 
 import torch
@@ -7,70 +7,55 @@ import chess
 import chess.engine
 import numpy as np
 import time
-from hrm_model import HRMChess
+from hrm_model import HRMChess, load_model_with_amp, inference_with_amp
 from collections import defaultdict
 import json
 import os
 import glob
 
 class ELORatingSystem:
-    def __init__(self, model_path=None):
-        """ELO mérési rendszer inicializálása - transformer-alapú HRM modellhez"""
+    def __init__(self, model_path=None, use_half=False):
+        """ELO mérési rendszer inicializálása - transformer-alapú HRM modellhez float16 optimalizációval"""
         import sys
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.use_half = use_half and self.device.type == 'cuda'
+        
         if model_path is None:
             model_path = self._select_model()
         self.model_path = model_path
         print(f"🎯 Loading transformer HRM model from: {model_path}")
-        # Load checkpoint and detect transformer params
+        
+        if self.use_half:
+            print("🚀 Float16 optimization enabled for faster inference")
+        
+        # Load model with AMP optimization
         try:
-            checkpoint = torch.load(self.model_path, map_location='cpu', weights_only=False)
-            # Try to get transformer params from hyperparams
-            if 'hyperparams' in checkpoint:
-                hyper = checkpoint['hyperparams']
-                emb_dim = hyper.get('emb_dim', hyper.get('hidden_dim', 128))
-                N = hyper.get('N', 4)
-                T = hyper.get('T', 4)
-                nhead = hyper.get('nhead', 4)
-                dim_feedforward = hyper.get('dim_feedforward', emb_dim * 2)
-            else:
-                print("No hyperparams found in model")
-                exit(0)
-            self.model = HRMChess(hidden_dim=emb_dim, N=N, T=T, nhead=nhead, dim_feedforward=dim_feedforward).to(self.device)
-            self.model_type = f"Transformer-HRM-{emb_dim}-N{N}-T{T}-nhead{nhead}-dff{dim_feedforward}"
-            print(f"🏗️ Created transformer HRM model: hidden_dim={emb_dim}, N={N}, T={T}, nhead={nhead}, dim_feedforward={dim_feedforward}")
+            self.model, self.model_info = load_model_with_amp(
+                self.model_path, 
+                device=self.device, 
+                use_half=self.use_half
+            )
+            
+            self.model_type = f"Transformer-HRM-{self.model_info['hidden_dim']}-N{self.model_info['N']}-T{self.model_info['T']}-nhead{self.model_info['nhead']}-dff{self.model_info['dim_feedforward']}"
+            if self.use_half:
+                self.model_type += "-FP16"
+                
+            print(f"✅ Transformer HRM model loaded successfully: {self.model_type}")
+            total_params = sum(p.numel() for p in self.model.parameters())
+            print(f"📊 Model parameters: {total_params:,}")
+            print(f"🔧 Architecture: Transformer + HRM heads → value bin classification")
+            
         except Exception as e:
-            print(f"⚠️ Error detecting model parameters: {e}")
-            print("🔧 Creating default transformer HRM model...")
+            print(f"❌ Error loading model: {e}")
+            # Fallback to default model
+            print("� Creating default transformer HRM model...")
             self.model = HRMChess(hidden_dim=128, N=4, T=4).to(self.device)
+            if self.use_half:
+                self.model.half()
             self.model_type = "Default-Transformer-HRM-128"
-        # Load model weights
-        if os.path.exists(self.model_path):
-            try:
-                checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
-                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                    state_dict = checkpoint['model_state_dict']
-                    if 'training_info' in checkpoint:
-                        info = checkpoint['training_info']
-                        epoch = info.get('epoch', 'N/A')
-                        val_loss = info.get('val_loss', 'N/A')
-                        val_loss_str = f"{val_loss:.4f}" if isinstance(val_loss, (int, float)) else str(val_loss)
-                        print(f"📈 Model training info: Epoch {epoch}, Val Loss: {val_loss_str}")
-                elif isinstance(checkpoint, dict) and 'hyperparams' in checkpoint:
-                    state_dict = {k: v for k, v in checkpoint.items() if k not in ['hyperparams', 'training_info']}
-                else:
-                    state_dict = checkpoint
-                self.model.load_state_dict(state_dict)
-                print(f"✅ Transformer HRM model loaded successfully: {self.model_type}")
-                total_params = sum(p.numel() for p in self.model.parameters())
-                print(f"📊 Model parameters: {total_params:,}")
-                print(f"🔧 Architecture: Transformer + HRM heads → value bin classification")
-            except Exception as e:
-                print(f"❌ Error loading model: {e}")
-                print("🔄 Initializing with random weights...")
-        else:
-            print(f"⚠️ Model file not found: {self.model_path}")
-            print("🔄 Using randomly initialized model for testing...")
+            if self.use_half:
+                self.model_type += "-FP16"
+                
         self.model.eval()
         self.games_played = []
         # Always initialize move index attributes to avoid AttributeError
@@ -194,38 +179,75 @@ class ELORatingSystem:
         
     def model_move(self, board, temperature=0.7, debug=False):
         """Lépés választás: minden lehetséges lépés utáni állást batch-ben kiértékel, a legjobb értékelést választja."""
-        import torch
-        from hrm_model import fen_to_tokens, bin_to_score
+        try:
+            self.model, self.model_info = load_model_with_amp(
+                self.model_path, 
+                device=self.device, 
+                use_half=self.use_half
+            )
+            self.model_type = f"Transformer-HRM-{self.model_info['hidden_dim']}-N{self.model_info['N']}-T{self.model_info['T']}-nhead{self.model_info['nhead']}-dff{self.model_info['dim_feedforward']}"
+            if self.use_half:
+                self.model_type += "-FP16"
+            print(f"✅ Transformer HRM model loaded successfully: {self.model_type}")
+            total_params = sum(p.numel() for p in self.model.parameters())
+            print(f"📊 Model parameters: {total_params:,}")
+            print(f"🔧 Architecture: Transformer + HRM heads → value bin classification")
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+            # Fallback to default model
+            print("🔄 Creating default transformer HRM model...")
+            self.model = HRMChess(hidden_dim=128, N=4, T=4).to(self.device)
+            if self.use_half:
+                self.model.half()
+            self.model_type = "Default-Transformer-HRM-128"
+            if self.use_half:
+                self.model_type += "-FP16"
+        self.model.eval()
+        self.games_played = []
+        # Always initialize move index attributes to avoid AttributeError
+        self.uci_move_list = []
+        self.uci_move_to_idx = {}
+    
+    def model_move(self, board, temperature=0.7, debug=False):
+        """Lépés választás: minden lehetséges lépés utáni állást batch-ben kiértékel, a legjobb értékelést választja."""
+        from hrm_model import fen_to_bitplanes, bin_to_score
+        
         legal_moves = list(board.legal_moves)
         if not legal_moves:
-            raise ValueError("No legal moves available.")
-        # Generáljuk az összes lehetséges következő FEN-t
+            return None, 0.0
+        
+        # Generate FENs for all possible moves
         next_fens = []
         for move in legal_moves:
             board_copy = board.copy()
             board_copy.push(move)
             next_fens.append(board_copy.fen())
+        
         # Bitplane-re alakítjuk az összes FEN-t (gyorsabb, numpy array-ből tensor)
-        from hrm_model import fen_to_bitplanes
         import numpy as np
         bitplane_np = np.array([fen_to_bitplanes(fen) for fen in next_fens], dtype=np.float32)  # [num_moves, 20, 8, 8]
         bitplane_batch = torch.from_numpy(bitplane_np).to(self.device)
         move_scores = np.full(len(legal_moves), -float('inf'), dtype=np.float32)
         move_info = []
-        with torch.no_grad():
-            out = self.model(bitplane_batch)  # [num_moves, num_bins]
-            for i, logits in enumerate(out):
-                value_probs = torch.softmax(logits / temperature, dim=0)
-                expected_bin = (value_probs * torch.arange(len(value_probs), device=value_probs.device)).sum().item()
-                win_percent = bin_to_score(expected_bin, num_bins=len(value_probs))
-                move_scores[i] = win_percent
-                move_info.append((legal_moves[i], win_percent))
+        
+        # Use optimized AMP inference
+        out = inference_with_amp(self.model, bitplane_batch, use_amp=True)  # [num_moves, num_bins]
+        
+        for i, logits in enumerate(out):
+            value_probs = torch.softmax(logits / temperature, dim=0)
+            expected_bin = (value_probs * torch.arange(len(value_probs), device=value_probs.device)).sum().item()
+            win_percent = bin_to_score(expected_bin, num_bins=len(value_probs))
+            move_scores[i] = win_percent
+            move_info.append((legal_moves[i], win_percent))
+        
         selected_idx = int(np.argmax(move_scores))
         selected_move = legal_moves[selected_idx]
-        move_confidence = move_scores[selected_idx]
+        move_confidence = float(move_scores[selected_idx])
+        
         if debug:
             move_info_sorted = sorted(move_info, key=lambda x: x[1], reverse=True)
             print(f"  Top moves: {[(str(m), round(s,2)) for m,s in move_info_sorted[:3]]}")
+            
         return selected_move, move_confidence
     
     def play_vs_stockfish(self, stockfish_path, depth=1, time_limit=0.05):
