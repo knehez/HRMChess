@@ -373,63 +373,95 @@ def get_manual_parameters():
     # Get hidden_dim
     while True:
         try:
-            hidden_dim = int(input("\nEnter hidden_dim (64-512): "))
+            hidden_dim = int(input("\nEnter hidden_dim (64-1024): "))
             if 64 <= hidden_dim <= 1024:
                 break
             else:
                 print("❌ Please enter a value between 64 and 1024")
         except ValueError:
             print("❌ Please enter a valid integer")
-    
+
     # Get N
     while True:
         try:
-            N = int(input("Enter N - reasoning cycles (2-12): "))
-            if 2 <= N <= 12:
+            N = int(input("Enter N - reasoning cycles (2-20): "))
+            if 2 <= N <= 20:
                 break
             else:
-                print("❌ Please enter a value between 2 and 12")
+                print("❌ Please enter a value between 2 and 20")
         except ValueError:
             print("❌ Please enter a valid integer")
-    
+
     # Get T
     while True:
         try:
-            T = int(input("Enter T - steps per cycle (2-12): "))
-            if 2 <= T <= 12:
+            T = int(input("Enter T - steps per cycle (2-20): "))
+            if 2 <= T <= 20:
                 break
             else:
-                print("❌ Please enter a value between 2 and 12")
+                print("❌ Please enter a value between 2 and 20")
         except ValueError:
             print("❌ Please enter a valid integer")
-    
+
+    # Get nhead
+    while True:
+        try:
+            nhead_in = input(f"Enter nhead (number of attention heads, default 4): ").strip()
+            if nhead_in == '':
+                nhead = 4
+                break
+            nhead = int(nhead_in)
+            if nhead >= 1 and nhead <= 32:
+                break
+            else:
+                print("❌ Please enter a value between 1 and 32")
+        except ValueError:
+            print("❌ Please enter a valid integer")
+
+    # Get dim_feedforward
+    while True:
+        try:
+            dff_in = input(f"Enter dim_feedforward (default {hidden_dim*2}): ").strip()
+            if dff_in == '':
+                dim_feedforward = hidden_dim * 2
+                break
+            dim_feedforward = int(dff_in)
+            if dim_feedforward >= hidden_dim:
+                break
+            else:
+                print(f"❌ Please enter a value >= hidden_dim ({hidden_dim})")
+        except ValueError:
+            print("❌ Please enter a valid integer")
+
     total_steps = N * T
-    
+
     # Estimate model complexity
     estimated_params = hidden_dim * (hidden_dim * 6 + 64*64) + hidden_dim * 3
     complexity_level = "Light" if total_steps <= 8 else "Medium" if total_steps <= 16 else "Heavy"
-    
+
     print("\n✅ Manual Configuration:")
     print(f"   • hidden_dim: {hidden_dim}")
     print(f"   • N: {N}, T: {T}")
+    print(f"   • nhead: {nhead}")
+    print(f"   • dim_feedforward: {dim_feedforward}")
     print(f"   • Total HRM steps: {total_steps}")
     print(f"   • Complexity: {complexity_level}")
     print(f"   • Estimated parameters: ~{estimated_params:,}")
-    
+
     if total_steps > 50:
         print("⚠️  Warning: Very high step count may slow training significantly")
     elif total_steps > 32:
         print("⚠️  Warning: High step count may slow training")
     elif total_steps < 4:
         print("⚠️  Warning: Very low step count may reduce model capacity")
-    
+
     # Confirmation
     confirm = input("\nProceed with this configuration? (y/n): ").strip().lower()
     if confirm not in ['y', 'yes']:
         print("🔄 Restarting parameter selection...")
         return get_manual_parameters()
-    
-    return hidden_dim, N, T
+
+    return hidden_dim, N, T, nhead, dim_feedforward
 
 # Import StockfishEvaluator and ParallelStockfishEvaluator from the new module
 from stockfish_eval import StockfishEvaluator, ParallelStockfishEvaluator
@@ -573,7 +605,7 @@ if __name__ == "__main__":
         dataset_size = len(fen_move_score_vec)
         print(f"\n📊 Dataset size: {dataset_size:,} positions")
         # MANUAL PARAMETERS
-        hidden_dim, N, T = get_manual_parameters()
+        hidden_dim, N, T, nhead, dim_feedforward = get_manual_parameters()
         # Apply GPU optimizations
         batch_size = gpu_config['batch_size']
         lr = 1e-4 * gpu_config['lr_multiplier']
@@ -583,7 +615,7 @@ if __name__ == "__main__":
         print(f"   📈 Learning Rate: {lr:.6f} (base: 2e-4 × {gpu_config['lr_multiplier']:.2f})")
         print(f"   🖥️ GPU Level: {gpu_config['optimization_level']}")
         # HRM modell létrehozása optimalizált paraméterekkel, több GPU támogatással
-        model = HRMChess(hidden_dim=hidden_dim, N=N, T=T).to(device)
+        model = HRMChess(hidden_dim=hidden_dim, N=N, T=T, nhead=nhead, dim_feedforward=dim_feedforward).to(device)
         if torch.cuda.device_count() > 1:
             print(f"🔗 Using {torch.cuda.device_count()} GPUs (DataParallel)")
             model = torch.nn.DataParallel(model)
@@ -628,7 +660,9 @@ if __name__ == "__main__":
                 'hidden_dim': hidden_dim,
                 'N': N,
                 'T': T,
-                'input_dim': 20
+                'input_dim': 20,
+                'nhead': nhead,
+                'dim_feedforward': dim_feedforward
             },
             'training_info': {
                 'epochs': epochs,

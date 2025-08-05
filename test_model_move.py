@@ -1,15 +1,12 @@
 import chess
 from elo_measurement import ELORatingSystem
 
-def test_model_move():
-    # Példa FEN: kezdőállás
-    fen = "6k1/5ppp/4r3/8/8/8/5PPP/3R2K1 w - -"
+def test_model_move(fen):
     board = chess.Board(fen)
-    elo_system = ELORatingSystem()
     move, confidence = elo_system.model_move(board, temperature=1.0, debug=True)
     print(f"model_move() választott lépés: {move}, confidence: {confidence:.3f}")
     # Top k moves kiírása
-    k = 5
+    k = 10
     # A model_move debug=True esetén kiírja a top 3-at, de itt explicit újra lekérjük
     # Újra meghívjuk, hogy move_info_sorted-ot is elérjük
     import torch
@@ -40,5 +37,22 @@ def test_model_move():
     assert 0.0 <= confidence <= 1.0, "A confidence érték nincs 0 és 1 között!"
     print("Teszt sikeres: model_move() működik.")
 
+def test_sequential_moves(fen, num_moves=20):
+    board = chess.Board(fen)
+    
+    print(f"\nKezdőállás: {fen}")
+    moves_played = []
+    for i in range(num_moves):
+        if board.is_game_over():
+            print(f"Játék vége: {board.result()} ({'matt' if board.is_checkmate() else 'patt'})")
+            break
+        move, confidence = elo_system.model_move(board, temperature=1.0, debug=False)
+        moves_played.append(board.san(move))
+        board.push(move)
+    print("Lépéssorozat:", ", ".join(moves_played))
+
 if __name__ == "__main__":
-    test_model_move()
+    fen = "6k1/5ppp/4r3/8/8/8/5PPP/3R2K1 w - -"
+    elo_system = ELORatingSystem()
+    test_model_move(fen)
+    test_sequential_moves(fen)

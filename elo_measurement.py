@@ -28,16 +28,17 @@ class ELORatingSystem:
             # Try to get transformer params from hyperparams
             if 'hyperparams' in checkpoint:
                 hyper = checkpoint['hyperparams']
-                emb_dim = hyper.get('emb_dim', hyper.get('hidden_dim', 128))  # <-- JAVÍTÁS: hidden_dim fallback
+                emb_dim = hyper.get('emb_dim', hyper.get('hidden_dim', 128))
                 N = hyper.get('N', 4)
                 T = hyper.get('T', 4)
+                nhead = hyper.get('nhead', 4)
+                dim_feedforward = hyper.get('dim_feedforward', emb_dim * 2)
             else:
-                emb_dim = 128
-                N = 4
-                T = 4
-            self.model = HRMChess(hidden_dim=emb_dim, N=N, T=T).to(self.device)
-            self.model_type = f"Transformer-HRM-{emb_dim}-N{N}-T{T}"
-            print(f"🏗️ Created transformer HRM model: hidden_dim={emb_dim}, N={N}, T={T}")
+                print("No hyperparams found in model")
+                exit(0)
+            self.model = HRMChess(hidden_dim=emb_dim, N=N, T=T, nhead=nhead, dim_feedforward=dim_feedforward).to(self.device)
+            self.model_type = f"Transformer-HRM-{emb_dim}-N{N}-T{T}-nhead{nhead}-dff{dim_feedforward}"
+            print(f"🏗️ Created transformer HRM model: hidden_dim={emb_dim}, N={N}, T={T}, nhead={nhead}, dim_feedforward={dim_feedforward}")
         except Exception as e:
             print(f"⚠️ Error detecting model parameters: {e}")
             print("🔧 Creating default transformer HRM model...")

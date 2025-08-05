@@ -76,7 +76,7 @@ class ValueBinDataset(torch.utils.data.Dataset):
 
 
 class HRMChess(nn.Module):
-    def __init__(self, num_bins=128, hidden_dim=256, N=8, T=8):
+    def __init__(self, num_bins=128, hidden_dim=256, N=8, T=8, nhead=None, dim_feedforward=None):
         super().__init__()
         self.N = N
         self.T = T
@@ -84,6 +84,14 @@ class HRMChess(nn.Module):
         self.num_bitplanes = 20
         self.board_size = 8
         self.seq_len = 8 * 8
+
+        # Attention defaults
+        if nhead is None:
+            nhead = 4
+        if dim_feedforward is None:
+            dim_feedforward = hidden_dim * 2
+        self.nhead = nhead
+        self.dim_feedforward = dim_feedforward
 
         # 2D convolution
         self.conv = nn.Sequential(
@@ -95,7 +103,7 @@ class HRMChess(nn.Module):
 
         # 🌟 Attention modul (Transformer encoder block)
         self.attn = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, nhead=4, dim_feedforward=hidden_dim * 2,
+            d_model=hidden_dim, nhead=self.nhead, dim_feedforward=self.dim_feedforward,
             dropout=0.1, activation='relu', batch_first=True
         )
 
@@ -197,8 +205,8 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=1e-4, warmup_epochs=
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
 
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
@@ -299,7 +307,9 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=1e-4, warmup_epochs=
                 'hyperparams': {
                     'hidden_dim': model.hidden_dim,
                     'N': model.N,
-                    'T': model.T
+                    'T': model.T,
+                    'nhead': model.nhead,
+                    'dim_feedforward': model.dim_feedforward
                 },
                 'training_info': {
                     'epoch': epoch,
