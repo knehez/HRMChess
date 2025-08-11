@@ -16,11 +16,23 @@ import csv
 import subprocess
 import time
 import math
+import random
 
 # Import HRM model and related functions
 from hrm_model import HRMChess, ValueBinDataset, train_loop
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+SEED = 42  # vagy bármilyen választott seed
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 def detect_gpu_memory_and_optimize_training():
     """
