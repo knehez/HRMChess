@@ -15,7 +15,7 @@ import uuid
 import glob
 
 # Import our trained model
-from hrm_model import HRMChess, fen_to_tokens, generate_all_possible_uci_moves
+from hrm_model import HRMChess
 
 app = Flask(__name__)
 app.secret_key = 'hrm_chess_secret_key_2025'  # Change in production
@@ -32,9 +32,6 @@ class ChessGameManager:
         self.model_path = model_path
         
         # Auto-detect and load model
-        # UCI lépés indexelés előkészítése (globális, fix sorrend)
-        self.uci_move_list = generate_all_possible_uci_moves()
-        self.uci_move_to_idx = {uci: i for i, uci in enumerate(self.uci_move_list)}
         self.load_model()
         
     def _select_model(self):
@@ -163,7 +160,7 @@ class ChessGameManager:
             print("❌ No trained HRM model found!")
             print("🔧 Please train the HRM model first using Chess.py")
             # Create a default HRM model for testing
-            self.model = HRMChess(emb_dim=192, N=8, T=8).to(self.device)
+            self.model = HRMChess(hidden_dim=192, N=8, T=8).to(self.device)
             self.model_info = "HRM-Untrained-192"
         else:
             try:
@@ -215,7 +212,7 @@ class ChessGameManager:
                             print(f"🔍 Auto-detected HRM hidden_dim: {hidden_dim} (from L_net)")
                 
                 # Create HRM model with detected parameters
-                self.model = HRMChess(emb_dim=hidden_dim, N=N, T=T).to(self.device)
+                self.model = HRMChess(hidden_dim=hidden_dim, N=N, T=T).to(self.device)
                 self.model.load_state_dict(model_state_dict)
                 
                 # Determine architecture type
@@ -245,34 +242,34 @@ class ChessGameManager:
         self.model.eval()
         
     def get_model_move(self, board):
-        """Get the best move from the HRM model (token-based, value head, win% confidence, robust UCI index handling)"""
+        """Get the best move from the HRM model using batch inference for all legal moves."""
         try:
-            from hrm_model import bin_to_score, fen_to_tokens
+            from hrm_model import bin_to_score, fen_to_bitplanes
             legal_moves = list(board.legal_moves)
             if not legal_moves:
                 return None, 0.0, 0.0
 
-            move_scores = []
-            move_info = []
-            fen = board.fen()
+            # Minden legális lépéshez elkészítjük a következő FEN-t
+            next_fens = []
+            for move in legal_moves:
+                board_copy = board.copy()
+                board_copy.push(move)
+                next_fens.append(board_copy.fen())
+
+            # Batch-ben generáljuk a bitplane tensorokat
+            import numpy as np
+            bitplane_np = np.array([fen_to_bitplanes(fen) for fen in next_fens], dtype=np.float32)
+            bitplane_batch = torch.from_numpy(bitplane_np).to(self.device)
+
+            move_scores = [-float('inf')] * len(legal_moves)
             with torch.no_grad():
-                fen_tokens = torch.tensor([fen_to_tokens(fen)], dtype=torch.long).to(self.device)  # [1, 77]
-                for move in legal_moves:
-                    uci = move.uci()
-                    uci_idx = self.uci_move_to_idx.get(uci, None)
-                    if uci_idx is None:
-                        move_scores.append(-float('inf'))
-                        move_info.append((move, -float('inf')))
-                        continue
-                    uci_tensor = torch.tensor([uci_idx], dtype=torch.long).to(self.device)
-                    out = self.model(fen_tokens, uci_tensor)
-                    value_logits = out.squeeze(0)
-                    value_probs = torch.softmax(value_logits, dim=0)
+                out = self.model(bitplane_batch)
+                for i, logits in enumerate(out):
+                    value_probs = torch.softmax(logits, dim=0)
                     expected_bin = (value_probs * torch.arange(len(value_probs), device=value_probs.device)).sum().item()
                     win_percent = bin_to_score(expected_bin, num_bins=len(value_probs))
-                    move_scores.append(win_percent)
-                    move_info.append((move, win_percent))
-            move_scores = np.array(move_scores)
+                    move_scores[i] = win_percent
+            move_info = list(zip(legal_moves, move_scores))
             selected_idx = int(np.argmax(move_scores))
             selected_move = legal_moves[selected_idx]
             move_confidence = move_scores[selected_idx]

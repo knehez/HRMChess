@@ -481,7 +481,7 @@ def create_dataset_from_games(max_positions=10000):
     print("📥 Loading PGN games...")
     try:
         pgn_fens = load_pgn_data(
-            "./lichess_db_standard_rated_2015-05.pgn",
+            "./lichess_db_standard_rated_2015-06.pgn",
             max_positions=max_positions,
             max_moves=100,
             min_elo=1000
@@ -537,7 +537,7 @@ if __name__ == "__main__":
             # Ask user for dataset size (max_positions)
             while True:
                 try:
-                    max_positions = int(input("Addja meg a pozíciók számát a tanító adatbázishoz (pl. 20000): "))
+                    max_positions = int(input("Adja meg a pozíciók számát a tanító adatbázishoz (pl. 20000): "))
                     if max_positions > 0:
                         break
                     else:

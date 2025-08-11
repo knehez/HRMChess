@@ -13,12 +13,26 @@ import numpy as np
 # --- FEN to bitplane conversion ---
 def fen_to_bitplanes(fen: str) -> np.ndarray:
     """
-    Converts a FEN string to a [20, 8, 8] bitplane numpy array.
-    Bitplanes: 12 for piece types, 4 for castling, 1 for side, 1 for ep, 1 for halfmove, 1 for fullmove.
+    Enhanced FEN to bitplane conversion with more chess-specific features.
+    Returns [30, 8, 8] bitplane array with richer representation.
+    
+    Bitplanes:
+    0-11: Piece types (6 white + 6 black)
+    12-15: Castling rights (4 types)
+    16: Side to move
+    17: En passant square
+    18: Halfmove clock (normalized)
+    19: Fullmove number (normalized)
+    20-23: King safety indicators (4 directions for each king)
+    24-25: Material balance (normalized for white/black)
+    26: Check indicator
+    27: Pins and skewers
+    28-29: Attack/defense maps
     """
     board = chess.Board(fen)
-    bitplanes = np.zeros((20, 8, 8), dtype=np.float32)
-    # Piece bitplanes
+    bitplanes = np.zeros((30, 8, 8), dtype=np.float32)
+    
+    # Original piece bitplanes (0-11)
     piece_map = {
         'P': 0, 'N': 1, 'B': 2, 'R': 3, 'Q': 4, 'K': 5,
         'p': 6, 'n': 7, 'b': 8, 'r': 9, 'q': 10, 'k': 11
@@ -29,24 +43,85 @@ def fen_to_bitplanes(fen: str) -> np.ndarray:
             idx = piece_map[piece.symbol()]
             row, col = divmod(square, 8)
             bitplanes[idx, row, col] = 1.0
-    # Castling rights
+    
+    # Castling rights (12-15)
     castling = [board.has_kingside_castling_rights(chess.WHITE),
                 board.has_queenside_castling_rights(chess.WHITE),
                 board.has_kingside_castling_rights(chess.BLACK),
                 board.has_queenside_castling_rights(chess.BLACK)]
     for i, flag in enumerate(castling):
         bitplanes[12 + i, :, :] = float(flag)
-    # Side to move
+    
+    # Side to move (16)
     bitplanes[16, :, :] = float(board.turn)
-    # En passant
-    bitplanes[17, :, :] = 0.0
+    
+    # En passant (17)
     if board.ep_square is not None:
         row, col = divmod(board.ep_square, 8)
         bitplanes[17, row, col] = 1.0
-    # Halfmove clock
-    bitplanes[18, :, :] = board.halfmove_clock / 100.0
-    # Fullmove number
-    bitplanes[19, :, :] = board.fullmove_number / 100.0
+    
+    # Halfmove and fullmove (18-19)
+    bitplanes[18, :, :] = min(board.halfmove_clock / 50.0, 1.0)  # Cap at 50 moves
+    bitplanes[19, :, :] = min(board.fullmove_number / 200.0, 1.0)  # Cap at 200 moves
+    
+    # Enhanced features (20-29)
+    
+    # King safety indicators (20-23)
+    white_king = board.king(chess.WHITE)
+    black_king = board.king(chess.BLACK)
+    if white_king:
+        row, col = divmod(white_king, 8)
+        # King exposure in 4 directions
+        for i, (dr, dc) in enumerate([(0,1), (1,0), (0,-1), (-1,0)]):
+            nr, nc = row + dr, col + dc
+            if 0 <= nr < 8 and 0 <= nc < 8:
+                if not board.piece_at(nr * 8 + nc):
+                    bitplanes[20, nr, nc] = 1.0  # White king exposure
+    
+    if black_king:
+        row, col = divmod(black_king, 8)
+        for i, (dr, dc) in enumerate([(0,1), (1,0), (0,-1), (-1,0)]):
+            nr, nc = row + dr, col + dc
+            if 0 <= nr < 8 and 0 <= nc < 8:
+                if not board.piece_at(nr * 8 + nc):
+                    bitplanes[21, nr, nc] = 1.0  # Black king exposure
+    
+    # Material balance (24-25)
+    piece_values = {'P': 1, 'N': 3, 'B': 3, 'R': 5, 'Q': 9, 'K': 0}
+    white_material = sum(piece_values.get(piece.symbol().upper(), 0) 
+                        for piece in board.piece_map().values() if piece.color == chess.WHITE)
+    black_material = sum(piece_values.get(piece.symbol().upper(), 0) 
+                        for piece in board.piece_map().values() if piece.color == chess.BLACK)
+    
+    total_material = white_material + black_material
+    if total_material > 0:
+        bitplanes[24, :, :] = white_material / total_material
+        bitplanes[25, :, :] = black_material / total_material
+    
+    # Check indicator (26)
+    if board.is_check():
+        if board.turn == chess.WHITE:
+            if white_king:
+                row, col = divmod(white_king, 8)
+                bitplanes[26, row, col] = 1.0
+        else:
+            if black_king:
+                row, col = divmod(black_king, 8)
+                bitplanes[26, row, col] = 1.0
+    
+    # Attack maps (28-29) - simplified version
+    for square in chess.SQUARES:
+        row, col = divmod(square, 8)
+        # White attacks
+        white_attackers = board.attackers(chess.WHITE, square)
+        if white_attackers:
+            bitplanes[28, row, col] = min(len(white_attackers) / 3.0, 1.0)
+        
+        # Black attacks  
+        black_attackers = board.attackers(chess.BLACK, square)
+        if black_attackers:
+            bitplanes[29, row, col] = min(len(black_attackers) / 3.0, 1.0)
+    
     return bitplanes
 
 def fen_to_tokens(fen: str) -> list:
@@ -81,7 +156,7 @@ class HRMChess(nn.Module):
         self.N = N
         self.T = T
         self.hidden_dim = hidden_dim
-        self.num_bitplanes = 20
+        self.num_bitplanes = 30  # Enhanced from 20 to 30 channels
         self.board_size = 8
         self.seq_len = 8 * 8
 

@@ -455,7 +455,7 @@ class ELORatingSystem:
         detailed_results = []
         
         for i, puzzle in enumerate(puzzles):
-            print(f"\n🧩 Puzzle {i+1}: 1{puzzle['rating']} ELO)")
+            print(f"\n🧩 Puzzle {i+1}: {puzzle['rating']} ELO)")
             board = chess.Board(puzzle["fen"])
             print(f"Position: {puzzle['fen']}")
             
