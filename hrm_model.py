@@ -9,6 +9,7 @@ import math
 from tqdm import tqdm
 import chess
 import numpy as np
+import wandb
 
 # --- FEN to bitplane conversion ---
 def fen_to_bitplanes(fen: str) -> np.ndarray:
@@ -156,7 +157,7 @@ class HRMChess(nn.Module):
         self.N = N
         self.T = T
         self.hidden_dim = hidden_dim
-        self.num_bitplanes = 30  # Enhanced from 20 to 30 channels
+        self.num_bitplanes = 30
         self.board_size = 8
         self.seq_len = 8 * 8
 
@@ -168,50 +169,44 @@ class HRMChess(nn.Module):
         self.nhead = nhead
         self.dim_feedforward = dim_feedforward
 
-        # 2D convolution
+        # 2D convolution with BatchNorm2d
         self.conv = nn.Sequential(
             nn.Conv2d(self.num_bitplanes, hidden_dim, kernel_size=3, padding=1),
-            nn.ReLU(),
+            nn.BatchNorm2d(hidden_dim),
+            nn.GELU(),
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.ReLU()
+            nn.BatchNorm2d(hidden_dim),
+            nn.GELU(),
         )
 
-        # 🌟 Attention modul (Transformer encoder block)
+        # Attention modul (Transformer encoder block)
         self.attn = nn.TransformerEncoderLayer(
             d_model=hidden_dim, nhead=self.nhead, dim_feedforward=self.dim_feedforward,
-            dropout=0.1, activation='relu', batch_first=True
+            dropout=0.1, activation='gelu', batch_first=True
         )
 
         # Flatten + enhancement
         self.board_enhancer = nn.Sequential(
-            nn.Linear(hidden_dim * self.seq_len, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
+            nn.Linear(hidden_dim * self.seq_len, hidden_dim * (self.seq_len // 16)),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim * (self.seq_len // 16), hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim)
         )
 
         # HRM modulok
-        self.L_net = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.LayerNorm(hidden_dim)
+        self.L_net = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=4, dim_feedforward=hidden_dim * 2, batch_first=True
         )
 
-        self.H_net = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.LayerNorm(hidden_dim)
+        self.H_net = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=4, dim_feedforward=hidden_dim * 2, batch_first=True
         )
 
         self.value_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(hidden_dim, num_bins)
         )
 
@@ -235,17 +230,21 @@ class HRMChess(nn.Module):
 
         for i in range(self.N * self.T - 1):
             with torch.no_grad():
-                l_input = torch.cat([z_L, z_H, board_enhanced], dim=-1)
-                z_L = self.L_net(l_input)
+                l_input = torch.stack([z_L, z_H, board_enhanced], dim=1)  # [B, 3, hidden_dim]
+                l_out = self.L_net(l_input)  # [B, 3, hidden_dim]
+                z_L = l_out.mean(dim=1)      # [B, hidden_dim]
                 if (i + 1) % self.T == 0:
-                    h_input = torch.cat([z_H, z_L], dim=-1)
-                    z_H = self.H_net(h_input)
+                    h_input = torch.stack([z_H, z_L], dim=1)  # [B, 2, hidden_dim]
+                    h_out = self.H_net(h_input)  # [B, 2, hidden_dim]
+                    z_H = h_out.mean(dim=1)      # [B, hidden_dim]
 
         # Final step (with grad)
-        l_input = torch.cat([z_L, z_H, board_enhanced], dim=-1)
-        z_L = self.L_net(l_input)
-        h_input = torch.cat([z_H, z_L], dim=-1)
-        z_H = self.H_net(h_input)
+        l_input = torch.stack([z_L, z_H, board_enhanced], dim=1)  # [B, 3, hidden_dim]
+        l_out = self.L_net(l_input)  # [B, 3, hidden_dim]
+        z_L = l_out.mean(dim=1)      # [B, hidden_dim]
+        h_input = torch.stack([z_H, z_L], dim=1)  # [B, 2, hidden_dim]
+        h_out = self.H_net(h_input)  # [B, 2, hidden_dim]
+        z_H = h_out.mean(dim=1)      # [B, hidden_dim]
 
         logits = self.value_head(z_H)  # [B, num_bins]
         return logits
@@ -283,6 +282,9 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=1e-4, warmup_epochs=
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Initialize wandb
+    wandb.init(project="hrmchess", name="training_run")
+
     print("\n🏗️ TRAINING LOOP")
     print("   ⚖️ Value bin classification (cross-entropy)")
     print(f"   🚀 AMP (float16): {'Enabled' if use_amp and device.type == 'cuda' else 'Disabled'}")
@@ -296,8 +298,13 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=1e-4, warmup_epochs=
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
 
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    import platform
+    if platform.system() == "Windows":
+        num_workers = 0
+    else:
+        num_workers = 8
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
@@ -335,18 +342,26 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=1e-4, warmup_epochs=
         train_batches = 0
         epoch_start_lr = optimizer.param_groups[0]['lr']
 
+        batch_loss_accum = 0.0
+        batch_count_accum = 0
+        print_interval = 10000
         for i, batch in enumerate(train_dataloader):
             batch = tuple(b.to(device) for b in batch)
             loss_info = train_step(model, batch, optimizer, scaler, use_amp)
             train_loss += loss_info['total_loss']
             train_batches += 1
+            batch_loss_accum += loss_info['total_loss']
+            batch_count_accum += 1
             scheduler.step()
             global_step += 1
-            if i % 10000 == 0 and i > 0:
+            if (i + 1) % print_interval == 0:
+                avg_loss = batch_loss_accum / batch_count_accum
                 current_lr = optimizer.param_groups[0]['lr']
                 warmup_progress = min(1.0, global_step / warmup_steps) * 100
-                print(f"Epoch {epoch}, Step {i}, Total loss: {loss_info['total_loss']:.4f}, "
-                        f"LR: {current_lr:.2e}, Warmup: {warmup_progress:.1f}%")
+                print(f"Epoch {epoch}, Step {i+1}, Avg loss: {avg_loss:.4f}, "
+                      f"LR: {current_lr:.2e}, Warmup: {warmup_progress:.1f}%")
+                batch_loss_accum = 0.0
+                batch_count_accum = 0
 
         # Validation phase
         model.eval()
@@ -381,7 +396,6 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=1e-4, warmup_epochs=
         epoch_end_lr = current_lr
 
         warmup_status = "🔥 WARMUP" if epoch < warmup_epochs else "📈 COSINE"
-        warmup_progress = min(1.0, global_step / warmup_steps) * 100
 
         print(f"📊 Epoch {epoch:2d}/{epochs} {warmup_status} | "
               f"Train loss: {avg_train_loss:.4f} | "
@@ -389,13 +403,20 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=1e-4, warmup_epochs=
               f"Val accuracy: {val_accuracy:.3f} | "
               f"LR: {epoch_start_lr:.2e}→{epoch_end_lr:.2e}")
 
-        if epoch < warmup_epochs:
-            print(f"    🔥 Warmup Progress: {warmup_progress:.1f}% ({global_step:,}/{warmup_steps:,} steps)")
+        # Log metrics to wandb
+        wandb.log({
+            "epoch": epoch,
+            "train_loss": avg_train_loss,
+            "val_loss": avg_val_loss,
+            "val_accuracy": val_accuracy,
+            "learning_rate": current_lr
+        })
 
         if epoch >= warmup_epochs:
             backup_scheduler.step(avg_val_loss)
 
-        if avg_val_loss < best_val_loss:
+        # check loss and accuracy improvement
+        if avg_val_loss < best_val_loss and val_accuracy > (checkpoint['training_info']['val_accuracy'] if 'checkpoint' in locals() else 0.0):
             best_val_loss = avg_val_loss
             patience_counter = 0
             checkpoint = {
@@ -422,15 +443,18 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=1e-4, warmup_epochs=
             print(f"✅ Best model saved! (Val loss: {avg_val_loss:.4f}, Val acc: {val_accuracy:.3f})")
         else:
             patience_counter += 1
-            if patience_counter >= max_patience:
-                print(f"⏹️ Early stopping at epoch {epoch} (patience exhausted)")
-                break
+            #if patience_counter >= max_patience:
+            #    print(f"⏹️ Early stopping at epoch {epoch} (patience exhausted)")
+            #    break
 
     print("\n🎉 Training with warmup completed!")
     print("📁 Best model: best_hrm_chess_model.pt")
     print(f"📊 Best validation loss: {best_val_loss:.4f}")
     print(f"🔥 Total training steps: {global_step:,}")
     print(f"🔥 Warmup completed: {min(global_step, warmup_steps):,}/{warmup_steps:,} steps")
+    
+    # Finish wandb run
+    wandb.finish()
 
 def score_to_bin(score: float, num_bins: int = 128) -> int:
     """
