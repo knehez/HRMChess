@@ -68,7 +68,7 @@ def choose_move(board):
         board_copy.push(move)
         next_fens.append(board_copy.fen())
     
-    bitplane_np = np.array([fen_to_bitplanes(fen) for fen in next_fens], dtype=np.float32)
+    bitplane_np = np.array([fen_to_bitplanes(fen, history_length=8) for fen in next_fens], dtype=np.float32)
     outputs = ort_session.run(None, {"input": bitplane_np})
     
     move_scores = []

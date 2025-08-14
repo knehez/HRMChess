@@ -134,6 +134,77 @@ class StockfishEvaluator:
             print(f"⚠️ Error getting all moves: {e}")
             return []
 
+    def get_best_move_only(self, fen):
+        """
+        Get best move and evaluation for position (compatible with Chess.py)
+        Returns: (best_move_uci, score)
+        """
+        if not self.initialized or not self.process:
+            print("⚠️ Stockfish engine not initialized")
+            return None, 0.5
+        
+        try:
+            # Check for game-ending conditions
+            board = chess.Board(fen)
+            
+            if board.is_checkmate():
+                return "CHECKMATE", 1.0
+            elif board.is_stalemate():
+                return "STALEMATE", 0.5
+            elif board.is_insufficient_material() or board.is_seventyfive_moves():
+                return "DRAW", 0.5
+            
+            # Get Stockfish evaluation for current position
+            self._send_command("ucinewgame")
+            self._send_command(f"position fen {fen}")
+            self._send_command(f"go movetime {self.movetime}")
+            
+            best_move = None
+            score = 0.5
+            
+            start_time = time.time()
+            timeout = (self.movetime / 1000) + 2
+            
+            while time.time() - start_time < timeout:
+                line = self._read_line()
+                if not line:
+                    continue
+                    
+                if line.startswith('bestmove'):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        move_candidate = parts[1]
+                        if move_candidate != "(none)":
+                            best_move = move_candidate
+                    break
+                    
+                # Parse score with perspective correction
+                if 'score cp' in line:
+                    parts = line.split()
+                    try:
+                        score_index = parts.index('cp') + 1
+                        cp_score = int(parts[score_index])
+                        # Apply perspective correction (negative for current player)
+                        score = self.stockfish_cp_to_winpercent(-cp_score)
+                    except (ValueError, IndexError):
+                        pass
+                        
+                elif 'score mate' in line:
+                    parts = line.split()
+                    try:
+                        mate_index = parts.index('mate') + 1
+                        mate_in_moves = int(parts[mate_index])
+                        # Apply perspective correction for mate
+                        score = 1.0 if mate_in_moves < 0 else 0.0
+                    except (ValueError, IndexError):
+                        pass
+            
+            return best_move, score
+                
+        except Exception as e:
+            print(f"⚠️ Error getting best move: {e}")
+            return None, 0.5
+
     def close(self):
         if self.process:
             try:

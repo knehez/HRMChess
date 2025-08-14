@@ -1,7 +1,6 @@
 
 import chess
 import numpy as np
-from hrm_model import fen_to_bitplanes
 
 # --- FEN to bitplane conversion ---
 import chess.pgn
@@ -9,17 +8,19 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numba
 import os
 import sys
-import csv
-import subprocess
+import pickle
+import random
 import time
-import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Any
+from stockfish_eval import StockfishEvaluator, ParallelStockfishEvaluator
+import time
 import random
 
 # Import HRM model and related functions
-from hrm_model import HRMChess, ValueBinDataset, train_loop
+from hrm_model import HRMChess, ValueBinDataset, train_loop, game_to_bitplanes
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -178,152 +179,306 @@ def detect_gpu_memory_and_optimize_training():
         print(" Cannot proceed without GPU information.")
         exit(1)
 
-def load_pgn_data(pgn_path, max_positions=None, max_moves=40, min_elo=1600):
-    all_fens = []
-    
-    # Debug counters
-    stats = {
-        'total_games': 0,
-        'elo_rejected': 0,
-        'result_rejected': 0,
-        'timecontrol_rejected': 0,
-        'processed_games': 0,
-        'positions_extracted': 0,
-        'piece_moves': 0,
-        'pawn_moves': 0,
-        'captures': 0,
-        'tactical_moves': 0
-    }
-    
-    with open(pgn_path, encoding="utf-8") as pgn:
-        while True:
-            game = chess.pgn.read_game(pgn)
-            if game is None:
-                break
-                
-            stats['total_games'] += 1
-            
-            if stats['total_games'] % 5000 == 0:
-                print(f"PGN processing: {stats['total_games']} games checked, "
-                      f"{stats['processed_games']} processed, {stats['positions_extracted']} positions")
-            
-            if max_positions < stats['positions_extracted']:
-                break
-            
-            # Szűrés: csak megfelelő játékosok játszmai
-            try:
-                white_elo = int(game.headers.get("WhiteElo", "0"))
-                black_elo = int(game.headers.get("BlackElo", "0"))
-                
-                # MAGASABB ELO minimum - jobb minőség
-                if not (white_elo >= min_elo and black_elo >= min_elo and 
-                       white_elo < 2800 and black_elo < 2800):
-                    stats['elo_rejected'] += 1
-                    continue
-                    
-                # Időkontroll és eredmény szűrés
-                time_control = game.headers.get("TimeControl", "")
-                result = game.headers.get("Result", "*")
-                
-                # Csak befejezett játszmák
-                if not (result in ["1-0", "0-1"]):  # Kizárjuk a döntetleneket!
-                    stats['result_rejected'] += 1
-                    continue
-                
-                if len(time_control) <= 3:
-                    stats['timecontrol_rejected'] += 1
-                    continue
-                        
-                # Ha minden szűrési feltétel teljesül, feldolgozzuk a játszmát
-                board = game.board()
-                node = game
-                move_count = 0
-                
-                # KÖZÉPJÁTÉK és VÉGJÁTÉK hangsúlyozása
-                opening_moves_to_skip = 8  # Több nyitás kihagyása
-                current_move = 0
-                game_moves = []
-                
-                # Előre gyűjtjük a lépéseket minőségi szűréshez
-                temp_board = game.board()
-                temp_node = game
-                while temp_node.variations:
-                    move = temp_node.variation(0).move
-                    game_moves.append((temp_board.copy(), move))
-                    temp_board.push(move)
-                    temp_node = temp_node.variation(0)
-                
-                # INTELLIGENS LÉPÉS SZELEKTÁLÁS
-                for board_state, move in game_moves:
-                    current_move += 1
-                    
-                    # Skip opening moves
-                    if current_move <= opening_moves_to_skip:
-                        board.push(move)
-                        node = node.variation(0)
-                        continue
-                    
-                    # MINŐSÉGI SZŰRÉS - csak érdekes lépések
-                    is_capture = board.is_capture(move)
-                    is_check = board.gives_check(move)
-                    is_piece_move = board.piece_at(move.from_square) and \
-                                   board.piece_at(move.from_square).piece_type != chess.PAWN
-                    is_tactical = is_capture or is_check or \
-                                 board.is_castling(move) or \
-                                 board.is_en_passant(move)
-                    
-                    # BALANCED SAMPLING - preferáljuk a bábu lépéseket és taktikai lépéseket
-                    include_move = False
-                    
-                    if is_tactical:  # Mindig befoglaljuk a taktikai lépéseket
-                        include_move = True
-                        stats['tactical_moves'] += 1
-                    elif is_piece_move:  # 80% eséllyel befoglaljuk a bábu lépéseket
-                        if np.random.random() < 0.8:
-                            include_move = True
-                            stats['piece_moves'] += 1
-                    else:  # Csak 30% eséllyel befoglaljuk a gyalog lépéseket
-                        if np.random.random() < 0.3:
-                            include_move = True
-                            stats['pawn_moves'] += 1
-                    
-                    if include_move:
-                        current_fen = board.fen()  # Store the actual FEN
-                        all_fens.append(current_fen)  # Store FEN for Stockfish evaluation
-                        stats['positions_extracted'] += 1
-                        
-                        if is_capture:
-                            stats['captures'] += 1
-                    
-                    board.push(move)
-                    node = node.variation(0)
-                    move_count += 1
-                    
-                    if move_count >= max_moves:
-                        break
-                
-                stats['processed_games'] += 1
-                        
-            except (ValueError, KeyError):
-                continue  # Skip games with missing/invalid data
-    
-    # Statistics
-    print(f"\nPGN Statistics: {stats['processed_games']:,} games processed, "
-          f"{stats['positions_extracted']:,} positions extracted")
-    
-    # Duplikált FEN-ek szűrése
-    unique_fen_idx = {}
-    for idx, fen in enumerate(all_fens):
-        if fen not in unique_fen_idx:
-            unique_fen_idx[fen] = idx
-    num_duplicates = len(all_fens) - len(unique_fen_idx)
-    
-    unique_indices = list(unique_fen_idx.values())
-    all_fens = [all_fens[i] for i in unique_indices]
+# Old PGN-based functions removed - using Stockfish parallel generation instead
 
-    print(f"Final dataset: {len(all_fens):,} unique positions "
-          f"({num_duplicates} duplicates removed)")
-    return all_fens
+# ================================
+# PARALLEL STOCKFISH DATASET GENERATOR
+# ================================
+
+class ParallelStockfishDatasetGenerator:
+    """Parallel chess dataset generator using multiple Stockfish engines"""
+    
+    def __init__(self, num_workers=4, movetime=50):
+        """Initialize the parallel dataset generator
+        
+        Args:
+            num_workers: Number of parallel Stockfish instances
+            movetime: Time in milliseconds for Stockfish analysis
+        """
+        self.num_workers = num_workers
+        self.movetime = movetime
+        self.dataset = []
+        
+    def generate_games_worker(self, worker_id: int, games_to_generate: List[int], 
+                             max_moves: int = 60, randomness: float = 0.15) -> List[Dict[str, Any]]:
+        """Generate multiple games in a single worker thread with one evaluator"""
+        try:
+            # Create one Stockfish evaluator for this worker for all games
+            evaluator = StockfishEvaluator(movetime=self.movetime)
+            
+            all_positions = []
+            total_games = len(games_to_generate)
+            start_time = time.time()
+            
+            for i, game_id in enumerate(games_to_generate):
+                try:
+                    game_positions = self._generate_single_game(
+                        evaluator, game_id, max_moves, randomness
+                    )
+                    all_positions.extend(game_positions)
+                    
+                    if worker_id == 0:
+                        elapsed = time.time() - start_time
+                        avg_time = elapsed / (i+1)
+                        remaining = avg_time * (total_games - (i+1))
+                        mins, secs = divmod(int(remaining), 60)
+                        print(f"   🎮 Worker {worker_id}: Game {i+1}/{total_games} done | "
+                                f"Positions: {len(game_positions)} | "
+                                f"Total: {len(all_positions)} | "
+                                f"ETA: {mins:02d}:{secs:02d}")
+                    
+                except Exception as e:
+                    print(f"⚠️  Worker {worker_id} game {game_id} error: {e}")
+                    continue
+            
+            # Clean up evaluator only once per worker
+            evaluator.close()
+            return all_positions
+            
+        except Exception as e:
+            print(f"⚠️  Worker {worker_id} error: {e}")
+            return []
+    
+    def _generate_single_game(self, evaluator: 'StockfishEvaluator', game_id: int, 
+                             max_moves: int, randomness: float) -> List[Dict[str, Any]]:
+        """Generate a single game using existing evaluator"""
+        board = chess.Board()
+        game_positions = []
+        moves_played = []
+        move_count = 0
+        
+        random_player_is_white = random.choice([True, False])
+        
+        while not board.is_game_over() and move_count < max_moves:
+            try:
+                # Get Stockfish best move and score
+                best_move, score = evaluator.get_best_move_only(board.fen())
+                
+                if best_move == "CHECKMATE":
+                    # Add final position with checkmate score
+                    compact_history = self.create_compact_history(board, moves_played, score)
+                    if compact_history:
+                        game_positions.append(compact_history)
+                    break
+                elif best_move in ["STALEMATE", "DRAW"] or best_move is None:
+                    break
+                
+                # Create compact history for current position
+                compact_history = self.create_compact_history(board, moves_played, score)
+                if compact_history:
+                    game_positions.append(compact_history)
+                
+                # Determine whose turn it is
+                current_player_is_white = board.turn
+                
+                # Only the selected player plays random moves
+                if current_player_is_white == random_player_is_white:
+                    if random.random() < randomness:
+                        legal_moves = list(board.legal_moves)
+                        if legal_moves:
+                            move = random.choice(legal_moves)
+                            move_to_play = move.uci()
+                        else:
+                            break
+                    else:
+                        move_to_play = best_move
+                else:
+                    move_to_play = best_move
+                
+                # Make the move
+                try:
+                    move = chess.Move.from_uci(move_to_play)
+                    if move in board.legal_moves:
+                        board.push(move)
+                        moves_played.append(move_to_play)
+                        move_count += 1
+                    else:
+                        break
+                except (ValueError, chess.InvalidMoveError):
+                    break
+                    
+            except Exception as e:
+                print(f"⚠️  Game {game_id} move error: {e}")
+                break
+        
+        return game_positions
+    
+    def create_compact_history(self, board: 'chess.Board', moves_played: List[str], score: float, 
+                             history_length: int = 8) -> Dict[str, Any]:
+        """Create compact history for current position"""
+        max_moves_before = history_length - 1
+        actual_moves_count = min(len(moves_played), max_moves_before)
+        
+        if actual_moves_count == 0:
+            # No history needed, use current position
+            position_starting_fen = board.fen()
+            position_moves = []
+        else:
+            # Create a temporary board to find the correct starting position
+            temp_board = chess.Board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+            
+            # Play all moves up to the history window start
+            moves_before_history = moves_played[:-actual_moves_count] if actual_moves_count < len(moves_played) else []
+            
+            for move_uci in moves_before_history:
+                try:
+                    move = chess.Move.from_uci(move_uci)
+                    if move in temp_board.legal_moves:
+                        temp_board.push(move)
+                    else:
+                        break
+                except (ValueError, chess.InvalidMoveError):
+                    break
+            
+            position_starting_fen = temp_board.fen()
+            position_moves = moves_played[-actual_moves_count:].copy()
+        
+        return {
+            'starting_fen': position_starting_fen,
+            'moves': position_moves,
+            'score': score
+        }
+    
+    def generate_dataset_parallel(self, num_games: int = 1000, max_moves: int = 60,
+                                randomness: float = 0.15) -> List[Dict[str, Any]]:
+        """Generate dataset using parallel workers with persistent evaluators"""
+        print("🚀 PARALLEL Stockfish dataset generation")
+        print(f"   Workers: {self.num_workers}")
+        print(f"   Games: {num_games}")
+        print(f"   Max moves per game: {max_moves}")
+        print(f"   Randomness: {randomness:.1%}")
+        print(f"   Stockfish time: {self.movetime}ms per position")
+        
+        start_time = time.time()
+        completed_games = 0
+        
+        # Distribute games among workers
+        games_per_worker = num_games // self.num_workers
+        remaining_games = num_games % self.num_workers
+        
+        worker_game_assignments = []
+        current_game_id = 0
+        
+        for worker_id in range(self.num_workers):
+            # Each worker gets base amount + 1 extra if there are remaining games
+            worker_games = games_per_worker + (1 if worker_id < remaining_games else 0)
+            worker_game_list = list(range(current_game_id, current_game_id + worker_games))
+            worker_game_assignments.append(worker_game_list)
+            current_game_id += worker_games
+        
+        print(f"   Game distribution: {[len(games) for games in worker_game_assignments]}")
+        
+        # Process games in batches using ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            # Submit worker tasks (each worker handles multiple games)
+            future_to_worker = {
+                executor.submit(
+                    self.generate_games_worker, 
+                    worker_id, 
+                    worker_game_assignments[worker_id], 
+                    max_moves, 
+                    randomness
+                ): worker_id
+                for worker_id in range(self.num_workers)
+            }
+            
+            # Process completed workers as they finish
+            for future in as_completed(future_to_worker):
+                worker_id = future_to_worker[future]
+                try:
+                    worker_positions = future.result()
+                    self.dataset.extend(worker_positions)
+                    worker_games = len(worker_game_assignments[worker_id])
+                    completed_games += worker_games
+                    
+                    # Progress reporting
+                    positions_per_game = len(self.dataset) / completed_games if completed_games > 0 else 0
+                    
+                    print(f"   Worker {worker_id} completed {worker_games} games | "
+                          f"Total games: {completed_games}/{num_games} | "
+                          f"Positions: {len(self.dataset):6d} | "
+                          f"Avg/game: {positions_per_game:.1f}")
+                        
+                except Exception as e:
+                    worker_games = len(worker_game_assignments[worker_id])
+                    print(f"⚠️  Error processing worker {worker_id} ({worker_games} games): {e}")
+                    completed_games += worker_games  # Still count as completed to avoid hanging
+        
+        total_time = time.time() - start_time
+        print("✅ PARALLEL dataset generation complete!")
+        print(f"   Total games: {num_games}")
+        print(f"   Total positions: {len(self.dataset)}")
+        print(f"   Average positions per game: {len(self.dataset)/num_games:.1f}")
+        print(f"   Total time: {total_time/60:.1f} minutes")
+        print(f"   Speed: {len(self.dataset)/(total_time/3600):.0f} positions/hour")
+        print(f"   Speedup: ~{self.num_workers:.1f}x theoretical")
+        
+        return self.dataset
+    
+    def save_dataset(self, filename: str = "parallel_stockfish_dataset.pt"):
+        """Save dataset to file"""
+        try:
+            with open(filename, 'wb') as f:
+                pickle.dump(self.dataset, f)
+        except Exception as e:
+            print(f"❌ Error saving dataset: {e}")
+    
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get dataset statistics"""
+        if not self.dataset:
+            return {}
+        
+        scores = [pos['score'] for pos in self.dataset]
+        move_counts = [len(pos['moves']) for pos in self.dataset]
+        
+        # Opening move analysis
+        opening_moves = []
+        for pos in self.dataset:
+            if len(pos['moves']) == 1:  # First move positions
+                opening_moves.append(pos['moves'][0])
+        
+        return {
+            'total_positions': len(self.dataset),
+            'score_range': (min(scores), max(scores)) if scores else (0, 0),
+            'avg_score': sum(scores) / len(scores) if scores else 0,
+            'move_count_range': (min(move_counts), max(move_counts)) if move_counts else (0, 0),
+            'avg_moves_per_position': sum(move_counts) / len(move_counts) if move_counts else 0,
+            'opening_moves_sample': opening_moves[:20]  # First 20 opening moves found
+        }
+
+
+def generate_stockfish_dataset_parallel(num_games=1000, num_workers=4, movetime=50, 
+                                       max_moves=60, randomness=0.15):
+    """Main function to generate parallel Stockfish dataset"""
+    print("🤖 Parallel Stockfish Dataset Generator")
+    print("=" * 50)
+    
+    generator = ParallelStockfishDatasetGenerator(num_workers, movetime)
+    
+    try:
+        dataset = generator.generate_dataset_parallel(
+            num_games=num_games,
+            max_moves=max_moves,
+            randomness=randomness
+        )
+        
+        # Show statistics
+        stats = generator.get_statistics()
+        print("📊 Final Dataset Statistics:")
+        for key, value in stats.items():
+            print(f"   {key}: {value}")
+        
+        print("🎯 Ready for training!")
+        
+        return dataset
+        
+    except KeyboardInterrupt:
+        print("⚠️ Generation interrupted by user")
+        if len(generator.dataset) > 0:
+            backup_filename = f"stockfish_dataset_backup_{len(generator.dataset)}.pt"
+            generator.save_dataset(backup_filename)
+            print(f"💾 Backup saved: {backup_filename}")
+        return generator.dataset
 
 def get_manual_parameters():
     """Get manual hyperparameters from user"""
@@ -413,48 +568,6 @@ def get_manual_parameters():
 # Import StockfishEvaluator and ParallelStockfishEvaluator from the new module
 from stockfish_eval import StockfishEvaluator, ParallelStockfishEvaluator
 
-def create_dataset_from_games(max_positions=10000):
-    """
-    Dataset létrehozása játszmákból - csak PGN alapú, puzzle nélkül
-    
-    Args:
-        max_positions: Maximális pozíciók száma a dataset-ben
-    """
-    import math
-    import time
-
-    print("\nCreating dataset from games...")
-
-    print("Loading PGN games...")
-    try:
-        pgn_fens = load_pgn_data(
-            "./lichess_db_standard_rated_2015-06.pgn",
-            max_positions=max_positions,
-            max_moves=100,
-            min_elo=1000
-        )
-        print(f"Loaded {len(pgn_fens):,} positions from PGN")
-    except Exception:
-        print("PGN file not found")
-        exit(0)
-
-    all_fens = pgn_fens
-
-    if len(all_fens) == 0:
-        print("No training data available!")
-        exit(0)
-
-    print(f"Total positions loaded: {len(all_fens):,}")
-
-    # Stockfish értékelés minden pozícióra
-    print("\nEvaluating all legal moves for all positions...")
-    stockfish = ParallelStockfishEvaluator(stockfish_path="stockfish.exe", movetime=10, num_evaluators=int(os.cpu_count() * 0.8) or 2)
-    all_move_evals = stockfish.evaluate_positions_parallel(all_fens)
-    stockfish.close()
-
-    print(f"Stockfish-evaluated dataset: {len(all_fens):,} positions")
-    return all_fens, all_move_evals
-
 if __name__ == "__main__":
     try:
         print("HRM CHESS MODEL TRAINING")
@@ -477,10 +590,10 @@ if __name__ == "__main__":
             }
         
         # Load or create dataset
-        dataset_path = "fen_move_score_dataset.pt"
+        dataset_path = "game_history_dataset.pt"
         if not os.path.exists(dataset_path):
             print(f"\nDataset not found: {dataset_path}")
-            print("Creating new dataset...")
+            print("Creating new dataset with game history...")
             # Ask user for dataset size
             while True:
                 try:
@@ -491,51 +604,53 @@ if __name__ == "__main__":
                         print("Please enter a positive number!")
                 except ValueError:
                     print("Please enter a valid integer!")
-            print(f"Creating dataset with {max_positions:,} positions")
             
-            # Create dataset
-            fens, moves = create_dataset_from_games(max_positions)
+            # Ask for history length
+            while True:
+                try:
+                    history_length = int(input("Enter history length in ply (default 8): ") or "8")
+                    if 1 <= history_length <= 16:
+                        break
+                    else:
+                        print("Please enter a value between 1 and 16!")
+                except ValueError:
+                    print("Please enter a valid integer!")
             
-            # Save as vector of (fen, score) tuples
+            print(f"Creating dataset with {max_positions:,} positions and {history_length}-ply history")
+            
+            # Use new Stockfish-based parallel dataset generation
+            print("🚀 Using Stockfish parallel dataset generation...")
+            
+            # Calculate number of games needed (roughly 40 positions per game)
+            estimated_games = max(100, max_positions // 40)
+            print(f"Generating ~{estimated_games} games to reach {max_positions:,} positions")
+            
+            # Generate dataset using parallel Stockfish
+            import multiprocessing
+            cpu_count = multiprocessing.cpu_count()
+            num_workers = max(1, int(cpu_count * 0.8))
+            compact_histories = generate_stockfish_dataset_parallel(
+                            num_games=estimated_games,
+                            num_workers=num_workers,
+                            movetime=50,
+                            max_moves=60,
+                            randomness=0.5
+                        )
+            
+            # Save as compact game history dataset
             from tqdm import tqdm
-            fen_move_score_vec = []
-            for fen, move_list in tqdm(zip(fens, moves), total=len(fens), desc="Processing positions"):
-                board = chess.Board(fen)
-                for move_tuple in move_list:
-                    move, score = move_tuple
-                    try:
-                        board.push(chess.Move.from_uci(move))
-                        resulting_fen = board.fen()
-                        fen_move_score_vec.append((resulting_fen, score))
-                        board.pop()
-                    except Exception as e:
-                        continue  # Skip illegal moves
-                        
-            # Deduplicate by FEN
-            print("\nDeduplicating by FEN...")
-            unique_fen_score = {}
-            for fen, score in fen_move_score_vec:
-                if fen not in unique_fen_score:
-                    unique_fen_score[fen] = score
-            num_duplicates = len(fen_move_score_vec) - len(unique_fen_score)
-            fen_move_score_vec = [(fen, score) for fen, score in unique_fen_score.items()]
-            print(f"Deduplicated: {len(fen_move_score_vec):,} unique positions, removed {num_duplicates:,} duplicates")
-            
-            output_pt = "fen_move_score_dataset.pt"
             dataset_info = {
-                'data': fen_move_score_vec,
+                'data': compact_histories,  # Now each item contains its own score
                 'info': {
                     'created': time.time(),
-                    'source': 'PGN + Stockfish (all legal moves, deduped FENs)',
-                    'base_positions': len(fens),
-                    'total_positions': len(fen_move_score_vec),
-                    'stockfish_evaluation': 'all_legal_moves',
-                    'evaluation_method': 'all_moves_winpercent',
-                    'data_format': '(fen, score)'
+                    'source': 'PGN with compact game history',
+                    'total_positions': len(compact_histories),
+                    'history_length': history_length,
+                    'data_format': 'compact_game_history (with embedded score)'
                 }
             }
-            torch.save(dataset_info, output_pt)
-            print(f"Saved {len(fen_move_score_vec):,} (fen, score) pairs to {output_pt}")
+            torch.save(dataset_info, dataset_path)
+            print(f"Saved {len(compact_histories):,} compact game histories to {dataset_path}")
             data = dataset_info
         else:
             # Load existing dataset
@@ -544,10 +659,11 @@ if __name__ == "__main__":
             
         # Extract data
         dataset_info = data if 'data' in data else data.get('dataset_info', {})
-        fen_move_score_vec = dataset_info['data']
+        game_history_data = dataset_info['data']
         info = dataset_info['info']
-        print(f"Dataset loaded: {len(fen_move_score_vec):,} positions")
+        print(f"Dataset loaded: {len(game_history_data):,} positions")
         print(f"Source: {info.get('source', 'Unknown')}")
+        print(f"History length: {info.get('history_length', 'Unknown')} ply")
         
         # MANUAL PARAMETERS
         hidden_dim, N, T, nhead, dim_feedforward = get_manual_parameters()
@@ -569,10 +685,10 @@ if __name__ == "__main__":
         hrm_steps = N * T
         print(f"Model: {total_params:,} parameters, {hrm_steps} HRM steps (N={N} × T={T})")
         
-        # Create dataset
-        fen_list = [fen for fen, score in fen_move_score_vec]
-        score_list = [score for fen, score in fen_move_score_vec]
-        dataset = ValueBinDataset(fen_list, score_list, num_bins=128)
+        # Create dataset with compact game histories (scores embedded)
+        compact_histories = game_history_data  # Each item now contains its own score
+        history_length = info.get('history_length', 8)
+        dataset = ValueBinDataset(compact_histories, num_bins=128, history_length=history_length)
         
         epochs = 30
         print(f"\nStarting training: {epochs} epochs, {len(dataset):,} positions")
@@ -592,7 +708,7 @@ if __name__ == "__main__":
                 'hidden_dim': hidden_dim,
                 'N': N,
                 'T': T,
-                'input_dim': 20,
+                'input_dim': 129,  # Updated for AlphaZero-style encoding with additional evaluation bitplanes
                 'nhead': nhead,
                 'dim_feedforward': dim_feedforward
             },
@@ -603,9 +719,10 @@ if __name__ == "__main__":
                 'warmup_epochs': 3,
                 'dataset_size': len(dataset),
                 'total_params': total_params,
-                'training_mode': 'policy_value_warmup',
+                'training_mode': 'game_history_training',
                 'gpu_optimized': True,
-                'gpu_config': gpu_config
+                'gpu_config': gpu_config,
+                'history_length': history_length
             }
         }
         

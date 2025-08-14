@@ -241,42 +241,77 @@ class ChessGameManager:
         
         self.model.eval()
         
-    def get_model_move(self, board):
+    def get_model_move(self, board, game_history=None):
         """Get the best move from the HRM model using batch inference for all legal moves."""
         try:
-            from hrm_model import bin_to_score, fen_to_bitplanes
+            from hrm_model import bin_to_score, game_to_bitplanes
             legal_moves = list(board.legal_moves)
             if not legal_moves:
                 return None, 0.0, 0.0
 
-            # Minden legális lépéshez elkészítjük a következő FEN-t
-            next_fens = []
+            # Build compact history for current position
+            if game_history is None or len(game_history) == 0:
+                # No game history available - use current position with empty history
+                current_compact_history = {
+                    'starting_fen': board.fen(),
+                    'moves': [],
+                    'score': 0.5
+                }
+            else:
+                # Use the actual game history
+                current_compact_history = {
+                    'starting_fen': game_history['starting_fen'],
+                    'moves': game_history['moves'],
+                    'score': 0.5
+                }
+
+            # Evaluate each possible move by looking at the resulting position
+            move_evaluations = []
+            
             for move in legal_moves:
+                # Make the move temporarily
                 board_copy = board.copy()
                 board_copy.push(move)
-                next_fens.append(board_copy.fen())
+                
+                # Create history for the position AFTER the move
+                new_history = current_compact_history.copy()
+                new_history['moves'] = current_compact_history['moves'] + [move.uci()]
+                
+                # Convert the resulting position to bitplanes
+                bitplanes = game_to_bitplanes(new_history, history_length=8)
+                move_evaluations.append((move, bitplanes))
 
-            # Batch-ben generáljuk a bitplane tensorokat
+            # Batch evaluation of all resulting positions
             import numpy as np
-            bitplane_np = np.array([fen_to_bitplanes(fen) for fen in next_fens], dtype=np.float32)
-            bitplane_batch = torch.from_numpy(bitplane_np).to(self.device)
-
-            move_scores = [-float('inf')] * len(legal_moves)
-            with torch.no_grad():
-                out = self.model(bitplane_batch)
-                for i, logits in enumerate(out):
-                    value_probs = torch.softmax(logits, dim=0)
-                    expected_bin = (value_probs * torch.arange(len(value_probs), device=value_probs.device)).sum().item()
-                    win_percent = bin_to_score(expected_bin, num_bins=len(value_probs))
-                    move_scores[i] = win_percent
-            move_info = list(zip(legal_moves, move_scores))
-            selected_idx = int(np.argmax(move_scores))
-            selected_move = legal_moves[selected_idx]
-            move_confidence = move_scores[selected_idx]
-            return selected_move, move_confidence / 100.0, move_confidence
+            if len(move_evaluations) > 0:
+                bitplane_batch = torch.from_numpy(np.array([eval[1] for eval in move_evaluations], dtype=np.float32)).to(self.device)
+                
+                move_scores = []
+                with torch.no_grad():
+                    logits_batch = self.model(bitplane_batch)
+                    
+                    for i, (move, _) in enumerate(move_evaluations):
+                        logits = logits_batch[i]
+                        value_probs = torch.softmax(logits, dim=0)
+                        expected_bin = (value_probs * torch.arange(len(value_probs), device=value_probs.device)).sum().item()
+                        win_percent = bin_to_score(expected_bin, num_bins=len(value_probs))
+                        move_scores.append(win_percent)
+                
+                # Choose the best move
+                selected_idx = int(np.argmax(move_scores))
+                selected_move = move_evaluations[selected_idx][0]
+                move_confidence = float(move_scores[selected_idx])
+                
+                return selected_move, move_confidence / 100.0, move_confidence
+            
+            # Fallback: return first legal move
+            return legal_moves[0], 0.5, 50.0
+            
         except Exception as e:
             print(f"HRM model error: {e}")
-            exit(0)
+            import traceback
+            traceback.print_exc()
+            return None, 0.0, 0.0
 
 # Global game manager instance
 _game_manager = None
@@ -310,14 +345,18 @@ def new_game():
     data = request.get_json()
     player_color = data.get('color', 'white')  # white or black
     
-    # Initialize game state
+    # Initialize game state with history tracking
     board = chess.Board()
     
     session[game_id] = {
         'board': board.fen(),
         'color': player_color,
         'moves': 0,
-        'status': 'active'
+        'status': 'active',
+        'game_history': {
+            'starting_fen': board.fen(),
+            'moves': []
+        }
     }
     
     response = {
@@ -329,11 +368,13 @@ def new_game():
     
     # If player chose black, make model's first move
     if player_color == 'black':
-        model_move, value, confidence = manager.get_model_move(board)
+        game_history = session[game_id]['game_history']
+        model_move, value, confidence = manager.get_model_move(board, game_history)
         if model_move:
             board.push(model_move)
             session[game_id]['board'] = board.fen()
             session[game_id]['moves'] = 1
+            session[game_id]['game_history']['moves'].append(model_move.uci())
             
             response['model_move'] = str(model_move)
             response['board'] = board.fen()
@@ -363,6 +404,9 @@ def make_move():
         
         board.push(move)
         
+        # Update game history with player move
+        game_state['game_history']['moves'].append(player_move)
+        
         # Update move count
         game_state['moves'] += 1
         
@@ -378,8 +422,9 @@ def make_move():
                 'winner': get_winner(board.result(), game_state['color'])
             })
         
-        # Get model's response move
-        model_move, value, confidence = get_game_manager().get_model_move(board)
+        # Get model's response move with game history
+        game_history = game_state['game_history']
+        model_move, value, confidence = get_game_manager().get_model_move(board, game_history)
         
         if model_move is None:
             game_state['status'] = 'finished'
@@ -393,6 +438,9 @@ def make_move():
         
         # Make model move
         board.push(model_move)
+        
+        # Update game history with model move
+        game_state['game_history']['moves'].append(model_move.uci())
         
         # Update move count
         game_state['moves'] += 1

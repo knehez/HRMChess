@@ -5,6 +5,7 @@ Convolutional HRM Chess Model ELO Rating
 import torch
 import chess
 import chess.engine
+import chess.pgn
 import numpy as np
 import time
 from hrm_model import HRMChess, load_model_with_amp, inference_with_amp
@@ -176,81 +177,88 @@ class ELORatingSystem:
         
         print(f"⚠️ N and T not saved in model, using defaults: N={N}, T={T}")
         return hidden_dim, N, T
-        
-    def model_move(self, board, temperature=0.7, debug=False):
-        """Lépés választás: minden lehetséges lépés utáni állást batch-ben kiértékel, a legjobb értékelést választja."""
-        try:
-            self.model, self.model_info = load_model_with_amp(
-                self.model_path, 
-                device=self.device, 
-                use_half=self.use_half
-            )
-            self.model_type = f"Transformer-HRM-{self.model_info['hidden_dim']}-N{self.model_info['N']}-T{self.model_info['T']}-nhead{self.model_info['nhead']}-dff{self.model_info['dim_feedforward']}"
-            if self.use_half:
-                self.model_type += "-FP16"
-            print(f"✅ Transformer HRM model loaded successfully: {self.model_type}")
-            total_params = sum(p.numel() for p in self.model.parameters())
-            print(f"📊 Model parameters: {total_params:,}")
-            print(f"🔧 Architecture: Transformer + HRM heads → value bin classification")
-        except Exception as e:
-            print(f"❌ Error loading model: {e}")
-            # Fallback to default model
-            print("🔄 Creating default transformer HRM model...")
-            self.model = HRMChess(hidden_dim=128, N=4, T=4).to(self.device)
-            if self.use_half:
-                self.model.half()
-            self.model_type = "Default-Transformer-HRM-128"
-            if self.use_half:
-                self.model_type += "-FP16"
-        self.model.eval()
-        self.games_played = []
-        # Always initialize move index attributes to avoid AttributeError
-        self.uci_move_list = []
-        self.uci_move_to_idx = {}
     
-    def model_move(self, board, temperature=0.7, debug=False):
-        """Lépés választás: minden lehetséges lépés utáni állást batch-ben kiértékel, a legjobb értékelést választja."""
-        from hrm_model import fen_to_bitplanes, bin_to_score
+    def model_move(self, board, temperature=1.0, debug=False, game_history=None):
+        """
+        Value-based move selection: 
+        1. Try each legal move
+        2. Evaluate the resulting position with the model
+        3. Choose the move that leads to the best position evaluation
+        """
+        from hrm_model import game_to_bitplanes, bin_to_score
         
         legal_moves = list(board.legal_moves)
         if not legal_moves:
             return None, 0.0
         
-        # Generate FENs for all possible moves
-        next_fens = []
+        # Build compact history for current position
+        if game_history is None or len(game_history) == 0:
+            # No game history available - use current position with empty history
+            current_compact_history = {
+                'starting_fen': board.fen(),
+                'moves': [],
+                'score': 0.5
+            }
+        else:
+            # Use the actual game history
+            current_compact_history = {
+                'starting_fen': game_history['starting_fen'],
+                'moves': game_history['moves'],
+                'score': 0.5
+            }
+        
+        # Evaluate each possible move by looking at the resulting position
+        move_evaluations = []
+        
         for move in legal_moves:
+            # Make the move temporarily
             board_copy = board.copy()
             board_copy.push(move)
-            next_fens.append(board_copy.fen())
-        
-        # Bitplane-re alakítjuk az összes FEN-t (gyorsabb, numpy array-ből tensor)
-        import numpy as np
-        bitplane_np = np.array([fen_to_bitplanes(fen) for fen in next_fens], dtype=np.float32)  # [num_moves, 20, 8, 8]
-        bitplane_batch = torch.from_numpy(bitplane_np).to(self.device)
-        move_scores = np.full(len(legal_moves), -float('inf'), dtype=np.float32)
-        move_info = []
-        
-        # Use optimized AMP inference
-        out = inference_with_amp(self.model, bitplane_batch, use_amp=True)  # [num_moves, num_bins]
-        
-        for i, logits in enumerate(out):
-            value_probs = torch.softmax(logits / temperature, dim=0)
-            expected_bin = (value_probs * torch.arange(len(value_probs), device=value_probs.device)).sum().item()
-            win_percent = bin_to_score(expected_bin, num_bins=len(value_probs))
-            move_scores[i] = win_percent
-            move_info.append((legal_moves[i], win_percent))
-        
-        selected_idx = int(np.argmax(move_scores))
-        selected_move = legal_moves[selected_idx]
-        move_confidence = float(move_scores[selected_idx])
-        
-        if debug:
-            move_info_sorted = sorted(move_info, key=lambda x: x[1], reverse=True)
-            print(f"  Top moves: {[(str(m), round(s,2)) for m,s in move_info_sorted[:3]]}")
             
-        return selected_move, move_confidence
+            # Create history for the position AFTER the move
+            new_history = current_compact_history.copy()
+            new_history['moves'] = current_compact_history['moves'] + [move.uci()]
+            
+            # Convert the resulting position to bitplanes
+            bitplanes = game_to_bitplanes(new_history, history_length=8)
+            move_evaluations.append((move, bitplanes))
+        
+        # Batch evaluation of all resulting positions
+        import numpy as np
+        if len(move_evaluations) > 0:
+            bitplane_batch = torch.from_numpy(np.array([eval[1] for eval in move_evaluations], dtype=np.float32)).to(self.device)
+            
+            # Use optimized AMP inference
+            with torch.no_grad():
+                logits_batch = inference_with_amp(self.model, bitplane_batch, use_amp=True)  # [num_moves, num_bins]
+            
+            move_scores = []
+            move_info = []
+            
+            for i, (move, _) in enumerate(move_evaluations):
+                logits = logits_batch[i]
+                value_probs = torch.softmax(logits / temperature, dim=0)
+                expected_bin = (value_probs * torch.arange(len(value_probs), device=value_probs.device)).sum().item()
+                win_percent = bin_to_score(expected_bin, num_bins=len(value_probs))
+
+                move_scores.append(win_percent)
+                move_info.append((move, win_percent))
+            
+            # Choose the best move
+            best_idx = int(np.argmax(move_scores))
+            selected_move = move_evaluations[best_idx][0]
+            move_confidence = float(move_scores[best_idx])
+            
+            if debug:
+                move_info_sorted = sorted(move_info, key=lambda x: x[1], reverse=True)
+                print(f"  Top moves: {[(str(m), round(s,3)) for m,s in move_info_sorted[:3]]}")
+                
+            return selected_move, move_confidence
+        
+        # Fallback: return first legal move
+        return legal_moves[0], 0.5
     
-    def play_vs_stockfish(self, stockfish_path, depth=1, time_limit=0.05):
+    def play_vs_stockfish(self, stockfish_path, depth=1, time_limit=0.05, pgn=False, model_is_white=True):
         """Továbbfejlesztett játék Stockfish ellen"""
         print(f"\n🤖 Playing against Stockfish (depth={depth}, time={time_limit}s)")
         
@@ -258,15 +266,21 @@ class ELORatingSystem:
             with chess.engine.SimpleEngine.popen_uci(stockfish_path) as engine:
                 board = chess.Board()
                 moves_played = []
-                model_is_white = True  # Model fehérrel játszik
                 game_log = []
+                
+                # Track game history for the model
+                game_history = {
+                    'starting_fen': board.fen(),
+                    'moves': []
+                }
                 
                 while not board.is_game_over() and len(moves_played) < 150:  # Longer games
                     if (board.turn == chess.WHITE) == model_is_white:
                         # Model lépése - agresszívebb beállítás
                         try:
-                            move, confidence = self.model_move(board, temperature=0.6, debug=False)
+                            move, confidence = self.model_move(board, temperature=0.3, debug=False, game_history=game_history)
                             board.push(move)
+                            game_history['moves'].append(move.uci())  # Track move in history
                             moves_played.append(f"Model: {move}")
                             game_log.append(f"Move {len(moves_played)}: Model plays {move} (conf: {confidence:.3f})")
                         except Exception as e:
@@ -277,6 +291,7 @@ class ELORatingSystem:
                         try:
                             result = engine.play(board, chess.engine.Limit(depth=depth, time=time_limit))
                             board.push(result.move)
+                            game_history['moves'].append(result.move.uci())  # Track move in history
                             moves_played.append(f"SF: {result.move}")
                             game_log.append(f"Move {len(moves_played)}: Stockfish plays {result.move}")
                         except Exception as e:
@@ -320,6 +335,12 @@ class ELORatingSystem:
                 # Show some key moves
                 if len(game_log) > 5:
                     print(f"Sample moves: {game_log[0]}, ..., {game_log[-1]}")
+                # PGN output if requested
+                if pgn:
+                    game_pgn = chess.pgn.Game.from_board(board)
+                    game_pgn.headers["White"] = "Model" if model_is_white else "Stockfish"
+                    game_pgn.headers["Black"] = "Stockfish" if model_is_white else "Model"
+                    print("\nPGN:\n", game_pgn)
                 
                 return game_data
                 
@@ -342,11 +363,18 @@ class ELORatingSystem:
             moves_played = 0
             max_moves = 80  # Rövidebb játszmák a döntetlen elkerülésére
             
+            # Track game history for the model (same as in play_vs_stockfish)
+            game_history = {
+                'starting_fen': board.fen(),
+                'moves': []
+            }
+            
             while not board.is_game_over() and moves_played < max_moves:
                 if (board.turn == chess.WHITE) == model_is_white:
                     # Model lépése - agresszívebb beállítással
-                    move, confidence = self.model_move(board, temperature=0.8)
+                    move, confidence = self.model_move(board, temperature=0.3, game_history=game_history)
                     board.push(move)
+                    game_history['moves'].append(move.uci())  # Track move in history
                 else:
                     # Random lépés - de nem teljesen véletlen
                     legal_moves = list(board.legal_moves)
@@ -367,12 +395,14 @@ class ELORatingSystem:
                             random_move = np.random.choice(legal_moves)
                     
                     board.push(random_move)
+                    game_history['moves'].append(random_move.uci())  # Track move in history
                 
                 moves_played += 1
             
             # Eredmény kiértékelése
             if board.is_game_over():
                 result = board.result()
+                print(f"Game {i+1}: {result} - {model_is_white}")
             else:
                 # Ha elérte a max_moves limitet, értékeljük pozíció alapján
                 # Egyszerű material count
@@ -455,12 +485,12 @@ class ELORatingSystem:
         detailed_results = []
         
         for i, puzzle in enumerate(puzzles):
-            print(f"\n🧩 Puzzle {i+1}: {puzzle['rating']} ELO)")
+            print(f"\n🧩 Puzzle {i+1}: ({puzzle['rating']} ELO)")
             board = chess.Board(puzzle["fen"])
             print(f"Position: {puzzle['fen']}")
             
             # Get model move with debug info
-            best_move, confidence = self.model_move(board, temperature=0.5, debug=True)
+            best_move, confidence = self.model_move(board, temperature=0.3, debug=False)
             
             # Check if move is correct (more flexible matching)
             correct = str(best_move) in puzzle["solution"]
@@ -522,15 +552,15 @@ class ELORatingSystem:
         
         ratings = {}
         
-        # 1. Random games alapmérés
-        random_results, random_elo = self.play_vs_random(games=20)
-        ratings["vs_random"] = random_elo
-        print(f"\n📊 vs Random: {random_elo:.0f} ELO")
-        
         # 2. Puzzle rating
         puzzle_elo = self.puzzle_rating()
         ratings["puzzle_rating"] = puzzle_elo
         print(f"\n🧩 Puzzle Rating: {puzzle_elo:.0f} ELO")
+        
+        1# 1. Random games alapmérés
+        random_results, random_elo = self.play_vs_random(games=20)
+        ratings["vs_random"] = random_elo
+        print(f"\n📊 vs Random: {random_elo:.0f} ELO")
         
         # 3. Stockfish games (ha elérhető)
         if stockfish_path and os.path.exists(stockfish_path):

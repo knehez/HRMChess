@@ -12,140 +12,234 @@ import numpy as np
 import wandb
 
 # --- FEN to bitplane conversion ---
-def fen_to_bitplanes(fen: str) -> np.ndarray:
+def game_to_bitplanes(move_history_compact: dict, history_length: int = 8) -> np.ndarray:
     """
-    Enhanced FEN to bitplane conversion with more chess-specific features.
-    Returns [30, 8, 8] bitplane array with richer representation.
+    AlphaZero-style game history to bitplane conversion: returns [129, 8, 8] numpy array.
+    Memory-efficient version that reconstructs board states from starting FEN + UCI moves.
     
-    Bitplanes:
-    0-11: Piece types (6 white + 6 black)
-    12-15: Castling rights (4 types)
-    16: Side to move
-    17: En passant square
-    18: Halfmove clock (normalized)
-    19: Fullmove number (normalized)
-    20-23: King safety indicators (4 directions for each king)
-    24-25: Material balance (normalized for white/black)
-    26: Check indicator
-    27: Pins and skewers
-    28-29: Attack/defense maps
+    0-55: White pieces (6 types x 8 ply history)
+    56-111: Black pieces (6 types x 8 ply history)
+    112: Side to move (1 if white, 0 if black)
+    113-116: Castling rights (KQkq)
+    117: En passant square
+    118: Move count (normalized)
+    119-122: King safety indicators (4 directions for each king)
+    123-124: Material balance (normalized for white/black)
+    125: Check indicator
+    126: Pins and skewers
+    127-128: Attack/defense maps
+    
+    Args:
+        move_history_compact: Dict with keys:
+            - 'starting_fen': FEN string of the starting position
+            - 'moves': List of UCI move strings, last move is Stockfish's best move
+            - 'score': Float score (0.0-1.0) for the last move from Stockfish
+        history_length: Number of ply to include in history (default 8)
     """
-    board = chess.Board(fen)
-    bitplanes = np.zeros((30, 8, 8), dtype=np.float32)
+    planes = np.zeros((129, 8, 8), dtype=np.float32)
+    piece_types = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
     
-    # Original piece bitplanes (0-11)
-    piece_map = {
-        'P': 0, 'N': 1, 'B': 2, 'R': 3, 'Q': 4, 'K': 5,
-        'p': 6, 'n': 7, 'b': 8, 'r': 9, 'q': 10, 'k': 11
-    }
-    for square in chess.SQUARES:
-        piece = board.piece_at(square)
-        if piece:
-            idx = piece_map[piece.symbol()]
-            row, col = divmod(square, 8)
-            bitplanes[idx, row, col] = 1.0
+    # Reconstruct board positions from starting FEN + moves
+    starting_fen = move_history_compact.get('starting_fen', chess.STARTING_FEN)
+    moves = move_history_compact.get('moves', [])
     
-    # Castling rights (12-15)
-    castling = [board.has_kingside_castling_rights(chess.WHITE),
-                board.has_queenside_castling_rights(chess.WHITE),
-                board.has_kingside_castling_rights(chess.BLACK),
-                board.has_queenside_castling_rights(chess.BLACK)]
-    for i, flag in enumerate(castling):
-        bitplanes[12 + i, :, :] = float(flag)
+    # Create board from starting position
+    board = chess.Board(starting_fen)
     
-    # Side to move (16)
-    bitplanes[16, :, :] = float(board.turn)
+    # Build history by applying moves step by step
+    history_positions = [board.copy()]  # Include starting position
     
-    # En passant (17)
-    if board.ep_square is not None:
-        row, col = divmod(board.ep_square, 8)
-        bitplanes[17, row, col] = 1.0
+    for move_uci in moves:
+        try:
+            move = chess.Move.from_uci(move_uci)
+            if move in board.legal_moves:
+                board.push(move)
+                history_positions.append(board.copy())
+            else:
+                print(f"⚠️ Illegal move {move_uci} in history, stopping reconstruction at ply {len(history_positions)}")
+                break
+        except (ValueError, chess.InvalidMoveError):
+            print(f"⚠️ Invalid UCI move {move_uci}, stopping reconstruction at ply {len(history_positions)}")
+            break
     
-    # Halfmove and fullmove (18-19)
-    bitplanes[18, :, :] = min(board.halfmove_clock / 50.0, 1.0)  # Cap at 50 moves
-    bitplanes[19, :, :] = min(board.fullmove_number / 200.0, 1.0)  # Cap at 200 moves
+    # Get current board (final position)
+    current_board = history_positions[-1] if history_positions else chess.Board()
     
-    # Enhanced features (20-29)
+    # Take the last history_length positions
+    if len(history_positions) > history_length:
+        history_positions = history_positions[-history_length:]
     
-    # King safety indicators (20-23)
-    white_king = board.king(chess.WHITE)
-    black_king = board.king(chess.BLACK)
-    if white_king:
-        row, col = divmod(white_king, 8)
-        # King exposure in 4 directions
-        for i, (dr, dc) in enumerate([(0,1), (1,0), (0,-1), (-1,0)]):
-            nr, nc = row + dr, col + dc
-            if 0 <= nr < 8 and 0 <= nc < 8:
-                if not board.piece_at(nr * 8 + nc):
-                    bitplanes[20, nr, nc] = 1.0  # White king exposure
+    # If we have fewer positions than history_length, pad with empty boards
+    while len(history_positions) < history_length:
+        history_positions.insert(0, chess.Board("8/8/8/8/8/8/8/8 w - - 0 1"))  # Empty board
     
-    if black_king:
-        row, col = divmod(black_king, 8)
-        for i, (dr, dc) in enumerate([(0,1), (1,0), (0,-1), (-1,0)]):
-            nr, nc = row + dr, col + dc
-            if 0 <= nr < 8 and 0 <= nc < 8:
-                if not board.piece_at(nr * 8 + nc):
-                    bitplanes[21, nr, nc] = 1.0  # Black king exposure
+    # Encode pieces for each ply in history
+    for ply_idx, board_state in enumerate(history_positions):
+        # White pieces (0-55: 6 types x 8 ply)
+        for piece_idx, piece_type in enumerate(piece_types):
+            for square in board_state.pieces(piece_type, chess.WHITE):
+                row, col = divmod(square, 8)
+                plane_idx = ply_idx * 6 + piece_idx
+                planes[plane_idx, row, col] = 1
+        
+        # Black pieces (56-111: 6 types x 8 ply)
+        for piece_idx, piece_type in enumerate(piece_types):
+            for square in board_state.pieces(piece_type, chess.BLACK):
+                row, col = divmod(square, 8)
+                plane_idx = 56 + ply_idx * 6 + piece_idx
+                planes[plane_idx, row, col] = 1
     
-    # Material balance (24-25)
-    piece_values = {'P': 1, 'N': 3, 'B': 3, 'R': 5, 'Q': 9, 'K': 0}
-    white_material = sum(piece_values.get(piece.symbol().upper(), 0) 
-                        for piece in board.piece_map().values() if piece.color == chess.WHITE)
-    black_material = sum(piece_values.get(piece.symbol().upper(), 0) 
-                        for piece in board.piece_map().values() if piece.color == chess.BLACK)
+    # Current position metadata (112-118)
+    # 112: side to move
+    planes[112, :, :] = int(current_board.turn)
+    
+    # 113-116: castling rights
+    planes[113, :, :] = int(current_board.has_kingside_castling_rights(chess.WHITE))
+    planes[114, :, :] = int(current_board.has_queenside_castling_rights(chess.WHITE))
+    planes[115, :, :] = int(current_board.has_kingside_castling_rights(chess.BLACK))
+    planes[116, :, :] = int(current_board.has_queenside_castling_rights(chess.BLACK))
+    
+    # 117: en passant
+    if current_board.ep_square is not None:
+        row, col = divmod(current_board.ep_square, 8)
+        planes[117, row, col] = 1
+    
+    # 118: move count (normalized)
+    planes[118, :, :] = current_board.fullmove_number / 100.0
+    
+    # Additional evaluation bitplanes (119-128)
+    
+    # 119-122: King safety indicators (4 directions for each king)
+    white_king_square = current_board.king(chess.WHITE)
+    black_king_square = current_board.king(chess.BLACK)
+    
+    if white_king_square is not None:
+        king_row, king_col = divmod(white_king_square, 8)
+        # Check king safety in 4 directions (N, E, S, W)
+        directions = [(-1, 0), (0, 1), (1, 0), (0, -1)]
+        for dir_idx, (dr, dc) in enumerate(directions):
+            safety_score = 0
+            for distance in range(1, 4):  # Check 3 squares in each direction
+                r, c = king_row + dr * distance, king_col + dc * distance
+                if 0 <= r < 8 and 0 <= c < 8:
+                    square = chess.square(c, r)
+                    piece = current_board.piece_at(square)
+                    if piece is not None and piece.color == chess.WHITE:
+                        safety_score += 1  # Own pieces provide safety
+                    elif piece is not None and piece.color == chess.BLACK:
+                        safety_score -= 1  # Enemy pieces reduce safety
+                else:
+                    break
+            # Normalize safety score and set for white king
+            normalized_safety = max(0, min(1, (safety_score + 3) / 6))
+            planes[119 + dir_idx, king_row, king_col] = normalized_safety
+    
+    if black_king_square is not None:
+        king_row, king_col = divmod(black_king_square, 8)
+        # Same calculation for black king, but inverted
+        directions = [(-1, 0), (0, 1), (1, 0), (0, -1)]
+        for dir_idx, (dr, dc) in enumerate(directions):
+            safety_score = 0
+            for distance in range(1, 4):
+                r, c = king_row + dr * distance, king_col + dc * distance
+                if 0 <= r < 8 and 0 <= c < 8:
+                    square = chess.square(c, r)
+                    piece = current_board.piece_at(square)
+                    if piece is not None and piece.color == chess.BLACK:
+                        safety_score += 1
+                    elif piece is not None and piece.color == chess.WHITE:
+                        safety_score -= 1
+                else:
+                    break
+            normalized_safety = max(0, min(1, (safety_score + 3) / 6))
+            planes[119 + dir_idx, king_row, king_col] = normalized_safety
+    
+    # 123-124: Material balance (normalized for white/black)
+    piece_values = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, 
+                   chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 0}
+    white_material = sum(piece_values[piece.piece_type] 
+                        for piece in current_board.piece_map().values() 
+                        if piece.color == chess.WHITE)
+    black_material = sum(piece_values[piece.piece_type] 
+                        for piece in current_board.piece_map().values() 
+                        if piece.color == chess.BLACK)
     
     total_material = white_material + black_material
     if total_material > 0:
-        bitplanes[24, :, :] = white_material / total_material
-        bitplanes[25, :, :] = black_material / total_material
+        white_ratio = white_material / total_material
+        black_ratio = black_material / total_material
+    else:
+        white_ratio = black_ratio = 0.5
     
-    # Check indicator (26)
-    if board.is_check():
-        if board.turn == chess.WHITE:
-            if white_king:
-                row, col = divmod(white_king, 8)
-                bitplanes[26, row, col] = 1.0
-        else:
-            if black_king:
-                row, col = divmod(black_king, 8)
-                bitplanes[26, row, col] = 1.0
+    planes[123, :, :] = white_ratio
+    planes[124, :, :] = black_ratio
     
-    # Attack maps (28-29) - simplified version
+    # 125: Check indicator
+    planes[125, :, :] = float(current_board.is_check())
+    
+    # 126: Pins and skewers
     for square in chess.SQUARES:
-        row, col = divmod(square, 8)
-        # White attacks
-        white_attackers = board.attackers(chess.WHITE, square)
-        if white_attackers:
-            bitplanes[28, row, col] = min(len(white_attackers) / 3.0, 1.0)
-        
-        # Black attacks  
-        black_attackers = board.attackers(chess.BLACK, square)
-        if black_attackers:
-            bitplanes[29, row, col] = min(len(black_attackers) / 3.0, 1.0)
+        piece = current_board.piece_at(square)
+        if piece is not None:
+            # Check if this piece is pinned
+            if current_board.is_pinned(piece.color, square):
+                row, col = divmod(square, 8)
+                planes[126, row, col] = 1
     
-    return bitplanes
+    # 127-128: Attack/defense maps
+    # 127: White attack map
+    for square in chess.SQUARES:
+        if current_board.is_attacked_by(chess.WHITE, square):
+            row, col = divmod(square, 8)
+            planes[127, row, col] = 1
+    
+    # 128: Black attack map  
+    for square in chess.SQUARES:
+        if current_board.is_attacked_by(chess.BLACK, square):
+            row, col = divmod(square, 8)
+            planes[128, row, col] = 1
+    
+    return planes
 
-def fen_to_tokens(fen: str) -> list:
+def fen_to_bitplanes(fen: str, history_length: int = 8) -> np.ndarray:
     """
-    Converts a FEN string to a list of 77 ASCII integer tokens (padded/truncated as needed).
+    Compatibility wrapper for single FEN conversion without history.
+    Creates a minimal compact history with just the current position.
+    
+    Args:
+        fen: FEN string of the current position
+        history_length: Number of ply to pad the history to (default 8)
+    
+    Returns:
+        np.ndarray: [129, 8, 8] bitplane array
     """
-    return [ord(c) for c in fen.ljust(77)[:77]]
+    # Create compact history format with just the current position
+    move_history_compact = {
+        'starting_fen': fen,
+        'moves': [],  # No moves, just the current position
+        'score': 0.5  # Neutral score for single FEN
+    }
+    return game_to_bitplanes(move_history_compact, history_length)
 
-# Dataset for value bin classification: (fen_tokens, uci_token, target_bin)
+
+
+# Dataset for value bin classification with compact game history support
 class ValueBinDataset(torch.utils.data.Dataset):
-    """Dataset for (fen, score) tuples, generates bitplane tensor and bin index on-the-fly."""
-    def __init__(self, fen_list, score_list, num_bins=128):
-        self.fen_list = fen_list
-        self.score_list = score_list
+    """Dataset for compact_game_history tuples, generates bitplane tensor and bin index on-the-fly."""
+    def __init__(self, compact_game_history_list, num_bins=128, history_length=8):
+        self.compact_game_history_list = compact_game_history_list
         self.num_bins = num_bins
+        self.history_length = history_length
 
     def __len__(self):
-        return len(self.fen_list)
+        return len(self.compact_game_history_list)
 
     def __getitem__(self, idx):
-        fen = self.fen_list[idx]
-        score = self.score_list[idx]
-        bitplanes = torch.tensor(fen_to_bitplanes(fen), dtype=torch.float32)
+        compact_game_history = self.compact_game_history_list[idx]
+        score = compact_game_history.get('score', 0.5)  # Extract score from compact history
+        
+        # Generate bitplanes from compact game history
+        bitplanes = torch.tensor(game_to_bitplanes(compact_game_history, self.history_length), dtype=torch.float32)
         bin_idx = score_to_bin(float(score), num_bins=self.num_bins)
         bin_idx_tensor = torch.tensor(bin_idx, dtype=torch.long)
         return bitplanes, bin_idx_tensor
@@ -157,7 +251,7 @@ class HRMChess(nn.Module):
         self.N = N
         self.T = T
         self.hidden_dim = hidden_dim
-        self.num_bitplanes = 30
+        self.num_bitplanes = 129
         self.board_size = 8
         self.seq_len = 8 * 8
 
