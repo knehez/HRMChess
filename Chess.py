@@ -1,4 +1,3 @@
-
 import chess
 import numpy as np
 
@@ -656,9 +655,35 @@ if __name__ == "__main__":
             # Load existing dataset
             print(f"\nLoading existing dataset: {dataset_path}")
             data = torch.load(dataset_path, weights_only=False)
+        
+        # Deduplicate loaded data (by starting_fen, moves)
+        if 'data' in data:
+            loaded_data = data['data']
+            unique_positions = set()
+            unique_entries = []
+            for entry in loaded_data:
+                key = (entry['starting_fen'], tuple(entry['moves']))
+                if key in unique_positions:
+                    continue
+                unique_positions.add(key)
+                unique_entries.append(entry)
+            print(f"   Positions before deduplication: {len(loaded_data)}")
+            print(f"   Positions after deduplication: {len(unique_entries)}")
+            dataset_info = {
+                'data': unique_entries,
+                'info': data.get('info', {})
+            }
+            # Free memory: remove large objects
+            del loaded_data
+            del unique_positions
+            del data
+            import gc
+            gc.collect()
+        else:
+            print("   Warning: No 'data' key found in loaded dataset for deduplication.")
+            dataset_info = data.get('dataset_info', {})
             
         # Extract data
-        dataset_info = data if 'data' in data else data.get('dataset_info', {})
         game_history_data = dataset_info['data']
         info = dataset_info['info']
         print(f"Dataset loaded: {len(game_history_data):,} positions")

@@ -557,7 +557,7 @@ class ELORatingSystem:
         ratings["puzzle_rating"] = puzzle_elo
         print(f"\n🧩 Puzzle Rating: {puzzle_elo:.0f} ELO")
         
-        1# 1. Random games alapmérés
+        # 1. Random games alapmérés
         random_results, random_elo = self.play_vs_random(games=20)
         ratings["vs_random"] = random_elo
         print(f"\n📊 vs Random: {random_elo:.0f} ELO")
