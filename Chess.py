@@ -505,7 +505,6 @@ def generate_stockfish_dataset_parallel(num_games=1000, num_workers=4, movetime=
             
             # Write PGN games (one per line)
             for i, pgn_game in enumerate(pgn_games):
-                f.write(f"[Game \"{i+1}\"]\n")
                 f.write(f"{pgn_game}\n\n")
         
         print(f"✅ PGN games saved to {pgn_filename}")
