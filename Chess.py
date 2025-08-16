@@ -13,7 +13,7 @@ import pickle
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from stockfish_eval import StockfishEvaluator, ParallelStockfishEvaluator
 import time
 import random
@@ -197,24 +197,28 @@ class ParallelStockfishDatasetGenerator:
         self.num_workers = num_workers
         self.movetime = movetime
         self.dataset = []
+        self.pgn_games = []  # Store PGN games separately
         
     def generate_games_worker(self, worker_id: int, games_to_generate: List[int], 
-                             max_moves: int = 60, randomness: float = 0.15) -> List[Dict[str, Any]]:
+                             max_moves: int = 60, randomness: float = 0.15) -> Tuple[List[Dict[str, Any]], List[str]]:
         """Generate multiple games in a single worker thread with one evaluator"""
         try:
             # Create one Stockfish evaluator for this worker for all games
             evaluator = StockfishEvaluator(movetime=self.movetime)
             
             all_positions = []
+            all_pgn_games = []
             total_games = len(games_to_generate)
             start_time = time.time()
             
             for i, game_id in enumerate(games_to_generate):
                 try:
-                    game_positions = self._generate_single_game(
+                    game_positions, pgn_game = self._generate_single_game(
                         evaluator, game_id, max_moves, randomness
                     )
                     all_positions.extend(game_positions)
+                    if pgn_game:  # Only add non-empty PGN games
+                        all_pgn_games.append(pgn_game)
                     
                     if worker_id == 0:
                         elapsed = time.time() - start_time
@@ -223,7 +227,7 @@ class ParallelStockfishDatasetGenerator:
                         mins, secs = divmod(int(remaining), 60)
                         print(f"   🎮 Worker {worker_id}: Game {i+1}/{total_games} done | "
                                 f"Positions: {len(game_positions)} | "
-                                f"Total: {len(all_positions)} | "
+                                f"Total pos: {len(all_positions)} | PGN: {len(all_pgn_games)} | "
                                 f"ETA: {mins:02d}:{secs:02d}")
                     
                 except Exception as e:
@@ -232,75 +236,97 @@ class ParallelStockfishDatasetGenerator:
             
             # Clean up evaluator only once per worker
             evaluator.close()
-            return all_positions
+            return all_positions, all_pgn_games
             
         except Exception as e:
             print(f"⚠️  Worker {worker_id} error: {e}")
             return []
     
     def _generate_single_game(self, evaluator: 'StockfishEvaluator', game_id: int, 
-                             max_moves: int, randomness: float) -> List[Dict[str, Any]]:
-        """Generate a single game using existing evaluator"""
+                             max_moves: int, randomness: float) -> Tuple[List[Dict[str, Any]], str]:
+        """Generate a single game using existing evaluator - returns positions and PGN string"""
         board = chess.Board()
         game_positions = []
         moves_played = []
+        moves_with_scores = []  # For PGN generation
         move_count = 0
         
         random_player_is_white = random.choice([True, False])
         
         while not board.is_game_over() and move_count < max_moves:
             try:
-                # Get Stockfish best move and score
-                best_move, score = evaluator.get_best_move_only(board.fen())
+                # Determine whose turn it is and if they play randomly
+                current_player_is_white = board.turn
+                will_play_random = (current_player_is_white == random_player_is_white and 
+                                   random.random() < randomness)
                 
-                if best_move == "CHECKMATE":
-                    # Add final position with checkmate score
-                    compact_history = self.create_compact_history(board, moves_played, score)
-                    if compact_history:
-                        game_positions.append(compact_history)
-                    break
-                elif best_move in ["STALEMATE", "DRAW"] or best_move is None:
-                    break
+                # Decide which move to play
+                if will_play_random:
+                    # Random move - no need for Stockfish best move
+                    legal_moves = list(board.legal_moves)
+                    if not legal_moves:
+                        break
+                    move = random.choice(legal_moves)
+                    move_to_play = move.uci()
+                    
+                    # Convert to SAN before making the move
+                    san_move = board.san(move)
+                    board.push(move)
+                    moves_played.append(move_to_play)
+                    
+                    # Evaluate position after random move for both compact history and PGN
+                    move_score = evaluator.get_position_evaluation(board.fen(), not board.turn)
+                else:
+                    # Best move - get from Stockfish
+                    best_move, original_score = evaluator.get_best_move_and_score(board.fen(), board.turn)
+                    
+                    if best_move == "CHECKMATE":
+                        break
+                    elif best_move in ["STALEMATE", "DRAW"] or best_move is None:
+                        break
+                    
+                    try:
+                        move = chess.Move.from_uci(best_move)
+                        if move not in board.legal_moves:
+                            break
+                        
+                        # Convert to SAN before making the move
+                        san_move = board.san(move)
+                        board.push(move)
+                        moves_played.append(best_move)
+                        
+                        # Use the original position score for best moves
+                        move_score = original_score
+                        
+                    except (ValueError, chess.InvalidMoveError):
+                        break
                 
-                # Create compact history for current position
-                compact_history = self.create_compact_history(board, moves_played, score)
+                # Add move with score to PGN list
+                moves_with_scores.append((san_move, move_score))
+                move_count += 1
+                
+                # Create compact history AFTER making the move - this saves 1 evaluation per turn
+                # because we don't create compact history for empty move history
+                compact_history = self.create_compact_history(board, moves_played, move_score)
                 if compact_history:
                     game_positions.append(compact_history)
-                
-                # Determine whose turn it is
-                current_player_is_white = board.turn
-                
-                # Only the selected player plays random moves
-                if current_player_is_white == random_player_is_white:
-                    if random.random() < randomness:
-                        legal_moves = list(board.legal_moves)
-                        if legal_moves:
-                            move = random.choice(legal_moves)
-                            move_to_play = move.uci()
-                        else:
-                            break
-                    else:
-                        move_to_play = best_move
-                else:
-                    move_to_play = best_move
-                
-                # Make the move
-                try:
-                    move = chess.Move.from_uci(move_to_play)
-                    if move in board.legal_moves:
-                        board.push(move)
-                        moves_played.append(move_to_play)
-                        move_count += 1
-                    else:
-                        break
-                except (ValueError, chess.InvalidMoveError):
-                    break
                     
             except Exception as e:
                 print(f"⚠️  Game {game_id} move error: {e}")
                 break
         
-        return game_positions
+        # Create PGN string with move numbers
+        pgn_moves = []
+        for i, (move_san, score) in enumerate(moves_with_scores):
+            move_num = (i // 2) + 1
+            if i % 2 == 0:  # White move
+                pgn_moves.append(f"{move_num}. {move_san} {score:.2f}")
+            else:  # Black move
+                pgn_moves.append(f"{move_san} {score:.2f}")
+        
+        pgn_game = " ".join(pgn_moves)
+        
+        return game_positions, pgn_game
     
     def create_compact_history(self, board: 'chess.Board', moves_played: List[str], score: float, 
                              history_length: int = 8) -> Dict[str, Any]:
@@ -309,9 +335,7 @@ class ParallelStockfishDatasetGenerator:
         actual_moves_count = min(len(moves_played), max_moves_before)
         
         if actual_moves_count == 0:
-            # No history needed, use current position
-            position_starting_fen = board.fen()
-            position_moves = []
+            return None
         else:
             # Create a temporary board to find the correct starting position
             temp_board = chess.Board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
@@ -339,8 +363,8 @@ class ParallelStockfishDatasetGenerator:
         }
     
     def generate_dataset_parallel(self, num_games: int = 1000, max_moves: int = 60,
-                                randomness: float = 0.15) -> List[Dict[str, Any]]:
-        """Generate dataset using parallel workers with persistent evaluators"""
+                                randomness: float = 0.15) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Generate dataset using parallel workers with persistent evaluators - returns positions and PGN games"""
         print("🚀 PARALLEL Stockfish dataset generation")
         print(f"   Workers: {self.num_workers}")
         print(f"   Games: {num_games}")
@@ -385,8 +409,9 @@ class ParallelStockfishDatasetGenerator:
             for future in as_completed(future_to_worker):
                 worker_id = future_to_worker[future]
                 try:
-                    worker_positions = future.result()
+                    worker_positions, worker_pgn_games = future.result()
                     self.dataset.extend(worker_positions)
+                    self.pgn_games.extend(worker_pgn_games)
                     worker_games = len(worker_game_assignments[worker_id])
                     completed_games += worker_games
                     
@@ -395,8 +420,8 @@ class ParallelStockfishDatasetGenerator:
                     
                     print(f"   Worker {worker_id} completed {worker_games} games | "
                           f"Total games: {completed_games}/{num_games} | "
-                          f"Positions: {len(self.dataset):6d} | "
-                          f"Avg/game: {positions_per_game:.1f}")
+                          f"Positions: {len(self.dataset):6d} | PGN games: {len(self.pgn_games)} | "
+                          f"Avg pos/game: {positions_per_game:.1f}")
                         
                 except Exception as e:
                     worker_games = len(worker_game_assignments[worker_id])
@@ -407,12 +432,13 @@ class ParallelStockfishDatasetGenerator:
         print("✅ PARALLEL dataset generation complete!")
         print(f"   Total games: {num_games}")
         print(f"   Total positions: {len(self.dataset)}")
+        print(f"   Total PGN games: {len(self.pgn_games)}")
         print(f"   Average positions per game: {len(self.dataset)/num_games:.1f}")
         print(f"   Total time: {total_time/60:.1f} minutes")
         print(f"   Speed: {len(self.dataset)/(total_time/3600):.0f} positions/hour")
         print(f"   Speedup: ~{self.num_workers:.1f}x theoretical")
         
-        return self.dataset
+        return self.dataset, self.pgn_games
     
     def save_dataset(self, filename: str = "parallel_stockfish_dataset.pt"):
         """Save dataset to file"""
@@ -455,11 +481,31 @@ def generate_stockfish_dataset_parallel(num_games=1000, num_workers=4, movetime=
     generator = ParallelStockfishDatasetGenerator(num_workers, movetime)
     
     try:
-        dataset = generator.generate_dataset_parallel(
+        dataset, pgn_games = generator.generate_dataset_parallel(
             num_games=num_games,
             max_moves=max_moves,
             randomness=randomness
         )
+        
+        # Save PGN games to text file
+        pgn_filename = f"stockfish_games_{len(pgn_games)}.pgn"
+        print(f"💾 Saving {len(pgn_games)} PGN games to {pgn_filename}...")
+        with open(pgn_filename, 'w', encoding='utf-8') as f:
+            # Write header with metadata
+            f.write(f"# Stockfish Generated Chess Games with Scores\n")
+            f.write(f"# Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"# Total games: {len(pgn_games)}\n")
+            f.write(f"# Format: move_number. move score (e.g., 1. e4 0.54 e5 0.48)\n")
+            f.write(f"# Workers: {num_workers}, Movetime: {movetime}ms\n")
+            f.write(f"# Max moves: {max_moves}, Randomness: {randomness:.1%}\n")
+            f.write(f"#\n")
+            
+            # Write PGN games (one per line)
+            for i, pgn_game in enumerate(pgn_games):
+                f.write(f"[Game \"{i+1}\"]\n")
+                f.write(f"{pgn_game}\n\n")
+        
+        print(f"✅ PGN games saved to {pgn_filename}")
         
         # Show statistics
         stats = generator.get_statistics()
@@ -469,15 +515,24 @@ def generate_stockfish_dataset_parallel(num_games=1000, num_workers=4, movetime=
         
         print("🎯 Ready for training!")
         
-        return dataset
+        return dataset, pgn_games
         
     except KeyboardInterrupt:
         print("⚠️ Generation interrupted by user")
-        if len(generator.dataset) > 0:
+        if len(generator.dataset) > 0 or len(generator.pgn_games) > 0:
             backup_filename = f"stockfish_dataset_backup_{len(generator.dataset)}.pt"
             generator.save_dataset(backup_filename)
-            print(f"💾 Backup saved: {backup_filename}")
-        return generator.dataset
+            
+            # Also save PGN backup
+            if len(generator.pgn_games) > 0:
+                pgn_backup = f"stockfish_pgn_backup_{len(generator.pgn_games)}.pgn"
+                with open(pgn_backup, 'w', encoding='utf-8') as f:
+                    for i, pgn_game in enumerate(generator.pgn_games):
+                        f.write(f"{pgn_game}\n\n")
+                print(f"💾 PGN backup saved: {pgn_backup}")
+            
+            print(f"💾 Dataset backup saved: {backup_filename}")
+        return generator.dataset, generator.pgn_games
 
 def get_manual_parameters():
     """Get manual hyperparameters from user"""
@@ -628,11 +683,11 @@ if __name__ == "__main__":
             import multiprocessing
             cpu_count = multiprocessing.cpu_count()
             num_workers = max(1, int(cpu_count * 0.8))
-            compact_histories = generate_stockfish_dataset_parallel(
+            compact_histories, pgn_games = generate_stockfish_dataset_parallel(
                             num_games=estimated_games,
                             num_workers=num_workers,
                             movetime=50,
-                            max_moves=60,
+                            max_moves=80,
                             randomness=0.5
                         )
             

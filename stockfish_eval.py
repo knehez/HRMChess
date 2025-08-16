@@ -72,53 +72,9 @@ class StockfishEvaluator:
     def stockfish_cp_to_winpercent(self, cp: int) -> float:
         return 0.5 * (2.0 / (1.0 + math.exp(-0.00368208 * cp)))
 
-    def get_all_moves(self, fen):
+    def get_best_move_and_score(self, fen, turn):
         """
-        Visszaadja az összes lehetséges lépést és értékét az adott FEN állásban.
-        Minden lépést végrehajt, értékel, majd visszaállítja a táblát.
-        Visszatérési érték: List[(move_uci, score)]
-        """
-        if not self.initialized or not self.stockfish:
-            print("⚠️ Stockfish engine not initialized")
-            return []
-        try:
-            board = chess.Board(fen)
-            all_moves = list(board.legal_moves)
-            move_scores = []
-            
-            for move in all_moves:
-                move_uci = move.uci()
-                # Make move on a copy of the board
-                board_after = board.copy()
-                board_after.push(move)
-                
-                # Set position and evaluate
-                self.stockfish.set_fen_position(board_after.fen())
-                evaluation = self.stockfish.get_evaluation()
-                
-                if evaluation:
-                    if evaluation['type'] == 'cp':
-                        # Convert centipawn to win percentage (invert for opponent's perspective)
-                        score = self.stockfish_cp_to_winpercent(-evaluation['value'])
-                    elif evaluation['type'] == 'mate':
-                        # Mate score: positive if we mate opponent, negative if opponent mates us
-                        mate_in_moves = evaluation['value']
-                        score = 1.0 if mate_in_moves > 0 else 0.0
-                    else:
-                        score = 0.5
-                else:
-                    score = 0.5
-                
-                move_scores.append((move_uci, score))
-            
-            return move_scores
-        except Exception as e:
-            print(f"⚠️ Error getting all moves: {e}")
-            return []
-
-    def get_best_move_only(self, fen):
-        """
-        Get best move and evaluation for position (compatible with Chess.py)
+        Get best move and evaluation for position
         Returns: (best_move_uci, score)
         """
         if not self.initialized or not self.stockfish:
@@ -126,18 +82,6 @@ class StockfishEvaluator:
             return None, 0.5
         
         try:
-            # Check for game-ending conditions
-            board = chess.Board(fen)
-            
-            if board.is_checkmate():
-                return "CHECKMATE", 0.0 if board.turn else 1.0
-            
-            if board.is_stalemate() or board.is_insufficient_material():
-                return "STALEMATE", 0.5
-            
-            if board.can_claim_draw():
-                return "DRAW", 0.5
-            
             # Set position in stockfish
             self.stockfish.set_fen_position(fen)
             
@@ -150,10 +94,14 @@ class StockfishEvaluator:
             evaluation = self.stockfish.get_evaluation()
             if evaluation:
                 if evaluation['type'] == 'cp':
-                    score = self.stockfish_cp_to_winpercent(-evaluation['value'])
+                    score = evaluation['value'] if turn else -evaluation['value']
+                    score = self.stockfish_cp_to_winpercent(score)
                 elif evaluation['type'] == 'mate':
                     mate_in_moves = evaluation['value']
-                    score = 1.0 if mate_in_moves > 0 else 0.0
+                    if (mate_in_moves > 0 and turn) or (mate_in_moves < 0 and not turn):
+                        score = 1.0
+                    else:
+                        score = 0.0
                 else:
                     score = 0.5
             else:
@@ -162,8 +110,51 @@ class StockfishEvaluator:
             return best_move, score
             
         except Exception as e:
-            print(f"⚠️ Error in get_best_move_only: {e}")
+            print(f"⚠️ Error in get_best_move_and_score: {e}")
             return None, 0.5
+
+    def get_position_evaluation(self, fen, turn):
+        """
+        Get only position evaluation (no best move calculation)
+        Returns: score
+        """
+        if not self.initialized or not self.stockfish:
+            print("⚠️ Stockfish engine not initialized")
+            return 0.5
+        
+        try:
+            # Set position in stockfish
+            self.stockfish.set_fen_position(fen)
+            
+            # Get evaluation only (this is faster than getting best move)
+            evaluation = self.stockfish.get_evaluation()
+            if evaluation:
+                if evaluation['type'] == 'cp':
+                    score = self.stockfish_cp_to_winpercent(evaluation['value'])
+                    if not turn:
+                        score = 1.0 - score
+                elif evaluation['type'] == 'mate':
+                    mate_in_moves = evaluation['value']
+                    if (mate_in_moves > 0 and turn) or (mate_in_moves < 0 and not turn):
+                        score = 1.0
+                    else:
+                        score = 0.0
+                else:
+                    score = 0.5
+            else:
+                score = 0.5
+            
+            return score
+            
+        except Exception as e:
+            print(f"⚠️ Error in get_position_evaluation: {e}")
+            return 0.5
+
+    def get_best_move_only(self, fen):
+        """
+        Legacy function - calls get_best_move_and_score for compatibility
+        """
+        return self.get_best_move_and_score(fen)
 
     def close(self):
         """Clean up stockfish engine"""
