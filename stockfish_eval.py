@@ -97,11 +97,7 @@ class StockfishEvaluator:
                     score = evaluation['value'] if turn else -evaluation['value']
                     score = self.stockfish_cp_to_winpercent(score)
                 elif evaluation['type'] == 'mate':
-                    mate_in_moves = evaluation['value']
-                    if (mate_in_moves > 0 and turn) or (mate_in_moves < 0 and not turn):
-                        score = 1.0
-                    else:
-                        score = 0.0
+                    score = 1.0
                 else:
                     score = 0.5
             else:

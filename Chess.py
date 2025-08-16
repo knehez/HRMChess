@@ -252,7 +252,9 @@ class ParallelStockfishDatasetGenerator:
         move_count = 0
         
         random_player_is_white = random.choice([True, False])
-        
+
+        mating_approach = False
+
         while not board.is_game_over() and move_count < max_moves:
             try:
                 # Determine whose turn it is and if they play randomly
@@ -275,15 +277,16 @@ class ParallelStockfishDatasetGenerator:
                     moves_played.append(move_to_play)
                     
                     # Evaluate position after random move for both compact history and PGN
-                    move_score = evaluator.get_position_evaluation(board.fen(), not board.turn)
+                    if not mating_approach:
+                        move_score = evaluator.get_position_evaluation(board.fen(), not board.turn)
+                    else:
+                        move_score = 1.0
                 else:
                     # Best move - get from Stockfish
                     best_move, original_score = evaluator.get_best_move_and_score(board.fen(), board.turn)
                     
-                    if best_move == "CHECKMATE":
-                        break
-                    elif best_move in ["STALEMATE", "DRAW"] or best_move is None:
-                        break
+                    if original_score == 1 or original_score == 0:
+                        mating_approach = True
                     
                     try:
                         move = chess.Move.from_uci(best_move)
