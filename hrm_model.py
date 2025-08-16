@@ -394,11 +394,37 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=1e-4, warmup_epochs=
 
     import platform
     if platform.system() == "Windows":
-        num_workers = 0
+        num_workers = 4  # Windows can handle 4 workers efficiently
     else:
         num_workers = 8
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    
+    # Debug CUDA info
+    print(f"🔍 CUDA available: {torch.cuda.is_available()}")
+    print(f"🔍 Device: {device}")
+    print(f"🔍 Device type: {device.type}")
+    
+    # Force pin_memory=True for CUDA (you have GPU)
+    use_pin_memory = True  # Force True since you have CUDA GPU
+    
+    # Enable pin_memory for faster GPU transfer and persistent workers for efficiency
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=num_workers,
+        pin_memory=use_pin_memory,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None
+    )
+    val_dataloader = torch.utils.data.DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=num_workers,
+        pin_memory=use_pin_memory,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None
+    )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
@@ -427,6 +453,12 @@ def train_loop(model, dataset, epochs=25, batch_size=16, lr=1e-4, warmup_epochs=
     print(f"📊 Training: {train_size:,} positions")
     print(f"📊 Validation: {val_size:,} positions")
     print(f"🔥 Total steps: {total_steps:,} (warmup: {warmup_steps:,})")
+    print(f"🚀 DataLoader workers: {num_workers} (pin_memory=True)")
+    
+    # GPU utilization monitoring
+    if device.type == 'cuda':
+        print(f"🎯 GPU: {torch.cuda.get_device_name()}")
+        print(f"💾 GPU Memory: {torch.cuda.get_device_properties(0).total_memory // 1024**3}GB")
 
     global_step = 0
 
