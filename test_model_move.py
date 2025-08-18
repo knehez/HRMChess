@@ -33,8 +33,8 @@ def test_model_move(fen):
         new_history = current_compact_history.copy()
         new_history['moves'] = current_compact_history['moves'] + [move.uci()]
         
-        # Convert the resulting position to bitplanes (with history)
-        bitplanes = game_to_bitplanes(new_history, history_length=8)
+        # Convert the resulting position to bitplanes (with reduced 41-channel history)
+        bitplanes = game_to_bitplanes(new_history)  # Now uses 41 channels with 2-ply history
         move_evaluations.append((move, bitplanes))
     
     # Batch evaluation of all resulting positions
@@ -81,7 +81,7 @@ def test_sequential_moves(fen, num_moves=20):
 
 if __name__ == "__main__":
     fen = "6k1/5ppp/4r3/8/8/8/5PPP/3R2K1 w - -"
-    
+
     # Enable float16 optimization for faster inference (requires CUDA)
     use_float16 = torch.cuda.is_available()
     if use_float16:

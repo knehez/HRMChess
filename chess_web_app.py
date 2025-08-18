@@ -278,7 +278,7 @@ class ChessGameManager:
                 new_history['moves'] = current_compact_history['moves'] + [move.uci()]
                 
                 # Convert the resulting position to bitplanes
-                bitplanes = game_to_bitplanes(new_history, history_length=8)
+                bitplanes = game_to_bitplanes(new_history)
                 move_evaluations.append((move, bitplanes))
 
             # Batch evaluation of all resulting positions

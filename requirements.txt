@@ -3,6 +3,9 @@ torch>=2.0.0
 numpy>=1.21.0
 chess>=1.999
 
+# Stockfish Python wrapper
+stockfish>=3.28.0
+
 # Hyperparameter optimization (optional)
 optuna>=3.0.0
 plotly>=5.0.0

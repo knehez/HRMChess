@@ -1,9 +1,6 @@
 import chess
 import numpy as np
-
-# --- FEN to bitplane conversion ---
 import chess.pgn
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,14 +9,13 @@ import sys
 import pickle
 import random
 import time
+import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Tuple
 from stockfish_eval import StockfishEvaluator, ParallelStockfishEvaluator
-import time
-import random
 
-# Import HRM model and related functions
-from hrm_model import HRMChess, ValueBinDataset, train_loop, game_to_bitplanes
+# Import Pure Vision Transformer model and related functions
+from hrm_model import PureViTChess, ValueBinDataset, train_loop, game_to_bitplanes
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -34,151 +30,170 @@ if torch.cuda.is_available():
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-def detect_gpu_memory_and_optimize_training():
-    """
-    GPU memória detektálás és automatikus batch size/learning rate optimalizálás
-    
-    Returns:
-        dict: Optimalizált training paraméterek
-    """
-    print("\nGPU Memory Detection & Training Optimization")
-    print("-" * 50)
-    
-    if not torch.cuda.is_available():
-        print("ERROR: CUDA not available - GPU required for training!")
-        exit(1)
-    
-    try:
-        # GPU információk lekérdezése
-        gpu_count = torch.cuda.device_count()
-        current_device = torch.cuda.current_device()
-        gpu_name = torch.cuda.get_device_name(current_device)
-        
-        # Memória információk
-        total_memory = torch.cuda.get_device_properties(current_device).total_memory
-        allocated_memory = torch.cuda.memory_allocated(current_device)
-        
-        # Elérhető memória kiszámítása (GB-ban)
-        total_gb = total_memory / (1024**3)
-        free_gb = (total_memory - allocated_memory) / (1024**3)
-        
-        print(f"GPU: {gpu_name} ({total_gb:.1f}GB total, {free_gb:.1f}GB free)")
-        
-        # Batch size optimalizálás SZABAD GPU memória alapján
-        if free_gb >= 20:  # RTX 4090 territory
-            batch_config = {
-                'batch_size': 128,
-                'lr_multiplier': 2.0,
-                'optimization_level': 'RTX_4090_ULTRA'
-            }
-        elif free_gb >= 16:  # RTX 4080/3090 territory  
-            batch_config = {
-                'batch_size': 96,
-                'lr_multiplier': 1.8,
-                'optimization_level': 'HIGH_END_PLUS'
-            }
-        elif free_gb >= 12:  # High-end territory
-            batch_config = {
-                'batch_size': 80,
-                'lr_multiplier': 1.6,
-                'optimization_level': 'HIGH_END_FREE'
-            }
-        elif free_gb >= 10:  # Good amount of memory
-            batch_config = {
-                'batch_size': 64,
-                'lr_multiplier': 1.4,
-                'optimization_level': 'HIGH_FREE'
-            }
-        elif free_gb >= 8:   # Mid-high memory
-            batch_config = {
-                'batch_size': 48,
-                'lr_multiplier': 1.2,
-                'optimization_level': 'MID_HIGH_FREE'
-            }
-        elif free_gb >= 6:   # Average memory
-            batch_config = {
-                'batch_size': 32,
-                'lr_multiplier': 1.0,
-                'optimization_level': 'MID_FREE'
-            }
-        elif free_gb >= 4:   # Low-mid memory
-            batch_config = {
-                'batch_size': 24,
-                'lr_multiplier': 0.9,
-                'optimization_level': 'LOW_MID_FREE'
-            }
-        elif free_gb >= 2:   # Low memory
-            batch_config = {
-                'batch_size': 16,
-                'lr_multiplier': 0.8,
-                'optimization_level': 'LOW_FREE'
-            }
-        else:  # <2GB szabad VRAM
-            print(f"ERROR: Insufficient GPU memory ({free_gb:.1f}GB < 2GB required)")
-            exit(1)
 
-        # Ha több GPU van, szorozzuk fel a batch_size-t és lr_multiplier-t
-        if gpu_count > 1:
-            batch_config['batch_size'] *= gpu_count
-            batch_config['lr_multiplier'] *= gpu_count * 0.9
-            batch_config['optimization_level'] += f"_MULTIGPUx{gpu_count}"
+def get_hyperparameters():
+    """Get hyperparameters from command line arguments or user input"""
+    parser = argparse.ArgumentParser(description='Train Pure Vision Transformer Chess Model')
+    parser.add_argument('--hidden_dim', type=int, help='Hidden dimension (64-1024)')
+    parser.add_argument('--n_heads', type=int, help='Number of attention heads (4-16)')
+    parser.add_argument('--n_layers', type=int, help='Number of transformer layers (3-8)')
+    parser.add_argument('--ff_mult', type=int, help='Feedforward multiplier (2-6)')
+    parser.add_argument('--dropout', type=float, help='Dropout rate (0.0-0.3)')
+    parser.add_argument('--lr', type=float, help='Learning rate (1e-5 to 1e-3)')
+    parser.add_argument('--batch_size', type=int, help='Batch size (16-128)')
+    parser.add_argument('--weight_decay', type=float, help='Weight decay (1e-6 to 1e-3)')
+    parser.add_argument('--epochs', type=int, default=10, help='Number of epochs')
+    parser.add_argument('--dataset_positions', type=int, help='Number of training positions (or "all")')
+    
+    args = parser.parse_args()
+    
+    # If any required parameter is missing, get from user input
+    if not all([args.hidden_dim, args.n_heads, args.n_layers, args.ff_mult, 
+               args.dropout, args.lr, args.batch_size, args.weight_decay]):
+        print("\n🎯 OPTIMIZED HYPERPARAMETER CONFIGURATION")
+        print("=" * 50)
+        print("Enter the optimized hyperparameters from hyperopt_search.py:")
         
-        # Memória foglaltság alapú finomhangolás
-        memory_usage_ratio = allocated_memory / total_memory
-        if memory_usage_ratio > 0.3:  # Ha már 30%+ foglalt
-            batch_config['batch_size'] = max(8, int(batch_config['batch_size'] * 0.7))
-            batch_config['lr_multiplier'] *= 0.9
+        params = {}
         
-        # Memory safety test
-        test_passed = True
-        try:
-            test_batch_size = batch_config['batch_size']
-            test_input = torch.randn(test_batch_size, 20, 8, 8, device=device)
-            test_hidden = torch.randn(test_batch_size, 256, device=device)
-            test_conv_features = torch.randn(test_batch_size, 128, 8, 8, device=device)
-            
-            test_memory = torch.cuda.memory_allocated(current_device)
-            test_memory_gb = test_memory / (1024**3)
-            
-            # Cleanup
-            del test_input, test_hidden, test_conv_features
-            torch.cuda.empty_cache()
-            
-            memory_threshold = 0.75 if free_gb >= 20 else 0.6
-            if test_memory_gb > free_gb * memory_threshold:
-                batch_config['batch_size'] = max(16, int(batch_config['batch_size'] * 0.7))
-                batch_config['lr_multiplier'] *= 0.9
-                
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                batch_config['batch_size'] = max(16, int(batch_config['batch_size'] * 0.6))
-                batch_config['lr_multiplier'] *= 0.8
-                test_passed = False
-            torch.cuda.empty_cache()
+        # Get parameters from user input if not provided via command line
+        params['hidden_dim'] = args.hidden_dim or get_parameter_input(
+            "Hidden dimension", int, 64, 1024, 
+            "Controls model capacity (64-1024)"
+        )
         
-        # Végső konfiguráció
-        result = {
-            'batch_size': batch_config['batch_size'],
-            'lr_multiplier': batch_config['lr_multiplier'],
-            'memory_gb': total_gb,
-            'free_memory_gb': free_gb,  # Hozzáadva a szabad memória info
-            'device_name': gpu_name,
-            'optimization_level': batch_config['optimization_level'],
-            'memory_test_passed': test_passed
+        params['n_heads'] = args.n_heads or get_parameter_input(
+            "Number of attention heads", int, 4, 16,
+            f"Must divide hidden_dim ({params['hidden_dim']})", 
+            lambda x: params['hidden_dim'] % x == 0
+        )
+        
+        params['n_layers'] = args.n_layers or get_parameter_input(
+            "Number of transformer layers", int, 3, 8,
+            "Controls model depth"
+        )
+        
+        params['ff_mult'] = args.ff_mult or get_parameter_input(
+            "Feedforward multiplier", int, 2, 6,
+            "Feedforward dim = hidden_dim * ff_mult"
+        )
+        
+        params['dropout'] = args.dropout or get_parameter_input(
+            "Dropout rate", float, 0.0, 0.3,
+            "Regularization strength"
+        )
+        
+        params['lr'] = args.lr or get_parameter_input(
+            "Learning rate", float, 1e-5, 1e-3,
+            "Optimizer learning rate (scientific notation: 3.5e-4)"
+        )
+        
+        params['batch_size'] = args.batch_size or get_parameter_input(
+            "Batch size", int, 16, 128,
+            "Training batch size"
+        )
+        
+        params['weight_decay'] = args.weight_decay or get_parameter_input(
+            "Weight decay", float, 1e-6, 1e-3,
+            "L2 regularization (scientific notation: 3.7e-5)"
+        )
+        
+        params['epochs'] = args.epochs
+        params['dataset_positions'] = args.dataset_positions
+        
+        return params
+    else:
+        # All parameters provided via command line
+        return {
+            'hidden_dim': args.hidden_dim,
+            'n_heads': args.n_heads, 
+            'n_layers': args.n_layers,
+            'ff_mult': args.ff_mult,
+            'dropout': args.dropout,
+            'lr': args.lr,
+            'batch_size': args.batch_size,
+            'weight_decay': args.weight_decay,
+            'epochs': args.epochs,
+            'dataset_positions': args.dataset_positions
         }
-        
-        print(f"Optimized config: batch_size={result['batch_size']}, "
-              f"lr_multiplier={result['lr_multiplier']:.2f}x, "
-              f"level={result['optimization_level']}")
-        
-        return result
-        
-    except Exception as e:
-        print(f"❌ GPU detection failed: {e}")
-        print(" Cannot proceed without GPU information.")
-        exit(1)
 
-# Old PGN-based functions removed - using Stockfish parallel generation instead
+
+def get_parameter_input(name, param_type, min_val, max_val, description, validator=None):
+    """Helper function to get a single parameter from user input with validation"""
+    while True:
+        try:
+            user_input = input(f"\n{name} ({min_val}-{max_val}): ")
+            if param_type == float:
+                # Handle scientific notation
+                value = float(user_input)
+            else:
+                value = param_type(user_input)
+            
+            if not (min_val <= value <= max_val):
+                print(f"❌ Value must be between {min_val} and {max_val}")
+                continue
+                
+            if validator and not validator(value):
+                print(f"❌ Invalid value. {description}")
+                continue
+                
+            print(f"✅ {name}: {value} - {description}")
+            return value
+            
+        except ValueError:
+            print(f"❌ Please enter a valid {param_type.__name__}")
+
+
+def print_configuration(params):
+    """Print the final configuration for user confirmation"""
+    print(f"\n🔧 FINAL CONFIGURATION")
+    print("=" * 40)
+    print(f"Model Architecture:")
+    print(f"  Hidden Dimension: {params['hidden_dim']}")
+    print(f"  Attention Heads: {params['n_heads']}")
+    print(f"  Transformer Layers: {params['n_layers']}")
+    print(f"  FF Multiplier: {params['ff_mult']}")
+    print(f"  Dropout Rate: {params['dropout']:.4f}")
+    
+    print(f"\nTraining Parameters:")
+    print(f"  Learning Rate: {params['lr']:.2e}")
+    print(f"  Batch Size: {params['batch_size']}")
+    print(f"  Weight Decay: {params['weight_decay']:.2e}")
+    print(f"  Epochs: {params['epochs']}")
+    
+    # Calculate estimated parameters
+    dim_feedforward = params['hidden_dim'] * params['ff_mult']
+    # Rough estimate for Pure ViT parameters
+    estimated_params = (
+        params['hidden_dim'] * params['hidden_dim'] * 4 +  # Patch embedding + pos embedding  
+        params['n_layers'] * (
+            params['hidden_dim'] * params['hidden_dim'] * 4 +  # Self-attention (Q, K, V, O)
+            params['hidden_dim'] * dim_feedforward * 2 +         # FFN
+            params['hidden_dim'] * 4                             # Layer norms
+        ) +
+        params['hidden_dim'] * 128  # Classification head
+    )
+    
+    print(f"\nModel Complexity:")
+    print(f"  Feedforward Dim: {dim_feedforward}")
+    print(f"  Estimated Parameters: {estimated_params:,}")
+    
+    if estimated_params < 1_000_000:
+        complexity = "Light"
+    elif estimated_params < 5_000_000:
+        complexity = "Medium"
+    else:
+        complexity = "Heavy"
+    print(f"  Complexity Level: {complexity}")
+    
+    while True:
+        confirm = input(f"\n✅ Proceed with this configuration? (y/n): ").strip().lower()
+        if confirm in ['y', 'yes']:
+            return True
+        elif confirm in ['n', 'no']:
+            return False
+        else:
+            print("Please enter 'y' or 'n'")
 
 # ================================
 # PARALLEL STOCKFISH DATASET GENERATOR
@@ -536,119 +551,27 @@ def generate_stockfish_dataset_parallel(num_games=1000, num_workers=4, movetime=
             print(f"💾 Dataset backup saved: {backup_filename}")
         return generator.dataset, generator.pgn_games
 
-def get_manual_parameters():
-    """Get manual hyperparameters from user"""
-    print("\nManual Parameter Configuration")
-    print("Guidelines: hidden_dim(128-512), N(2-8), T(2-8), total_steps=N×T(6-32)")
-    
-    # Get hidden_dim
-    while True:
-        try:
-            hidden_dim = int(input("\nEnter hidden_dim (64-1024): "))
-            if 64 <= hidden_dim <= 1024:
-                break
-            else:
-                print("Please enter a value between 64 and 1024")
-        except ValueError:
-            print("Please enter a valid integer")
-
-    # Get N
-    while True:
-        try:
-            N = int(input("Enter N - reasoning cycles (2-20): "))
-            if 2 <= N <= 20:
-                break
-            else:
-                print("Please enter a value between 2 and 20")
-        except ValueError:
-            print("Please enter a valid integer")
-
-    # Get T
-    while True:
-        try:
-            T = int(input("Enter T - steps per cycle (2-20): "))
-            if 2 <= T <= 20:
-                break
-            else:
-                print("Please enter a value between 2 and 20")
-        except ValueError:
-            print("Please enter a valid integer")
-
-    # Get nhead
-    while True:
-        try:
-            nhead_in = input("Enter nhead (default 4): ").strip()
-            if nhead_in == '':
-                nhead = 4
-                break
-            nhead = int(nhead_in)
-            if nhead >= 1 and nhead <= 32:
-                break
-            else:
-                print("Please enter a value between 1 and 32")
-        except ValueError:
-            print("Please enter a valid integer")
-
-    # Get dim_feedforward
-    while True:
-        try:
-            dff_in = input(f"Enter dim_feedforward (default {hidden_dim*2}): ").strip()
-            if dff_in == '':
-                dim_feedforward = hidden_dim * 2
-                break
-            dim_feedforward = int(dff_in)
-            if dim_feedforward >= hidden_dim:
-                break
-            else:
-                print(f"Please enter a value >= {hidden_dim}")
-        except ValueError:
-            print("Please enter a valid integer")
-
-    total_steps = N * T
-    if total_steps <= 8:
-        complexity_level = "Light"
-    elif total_steps <= 16:
-        complexity_level = "Medium"
-    else:
-        complexity_level = "Heavy"
-
-    print(f"\nConfiguration: hidden_dim={hidden_dim}, N={N}, T={T}, "
-          f"total_steps={total_steps}, complexity={complexity_level}")
-
-    confirm = input("Proceed? (y/n): ").strip().lower()
-    if confirm not in ['y', 'yes']:
-        return get_manual_parameters()
-
-    return hidden_dim, N, T, nhead, dim_feedforward
-
 # Import StockfishEvaluator and ParallelStockfishEvaluator from the new module
 from stockfish_eval import StockfishEvaluator, ParallelStockfishEvaluator
 
 if __name__ == "__main__":
     try:
-        print("HRM CHESS MODEL TRAINING")
-        print("=" * 30)
+        print("🏆 PURE VISION TRANSFORMER CHESS MODEL TRAINING")
+        print("=" * 60)
         print(f"Using device: {device}")
         
-        # GPU MEMORY DETECTION & OPTIMIZATION
-        if torch.cuda.is_available():
-            gpu_config = detect_gpu_memory_and_optimize_training()
-        else:
-            print("CUDA not available - using CPU training parameters")
-            gpu_config = {
-                'batch_size': 8,
-                'lr_multiplier': 1.0,
-                'memory_gb': 0,
-                'free_memory_gb': 0,
-                'device_name': 'cpu',
-                'optimization_level': 'CPU_DEFAULT',
-                'memory_test_passed': True
-            }
+        # Get optimized hyperparameters
+        params = get_hyperparameters()
+        
+        # Show configuration and get user confirmation
+        if not print_configuration(params):
+            print("Training cancelled by user.")
+            sys.exit(0)
         
         # Load or create dataset
         dataset_path = "game_history_dataset.pt"
         if not os.path.exists(dataset_path):
-            print(f"\nDataset not found: {dataset_path}")
+            print(f"\n📂 Dataset not found: {dataset_path}")
             print("Creating new dataset with game history...")
             # Ask user for dataset size
             while True:
@@ -690,7 +613,7 @@ if __name__ == "__main__":
                             num_workers=num_workers,
                             movetime=50,
                             max_moves=80,
-                            randomness=0.5
+                            randomness=0.3
                         )
             
             # Save as compact game history dataset
@@ -710,7 +633,7 @@ if __name__ == "__main__":
             data = dataset_info
         else:
             # Load existing dataset
-            print(f"\nLoading existing dataset: {dataset_path}")
+            print(f"\n📂 Loading existing dataset: {dataset_path}")
             data = torch.load(dataset_path, weights_only=False)
         
         # Deduplicate loaded data (by starting_fen, moves)
@@ -747,38 +670,91 @@ if __name__ == "__main__":
         print(f"Source: {info.get('source', 'Unknown')}")
         print(f"History length: {info.get('history_length', 'Unknown')} ply")
         
-        # MANUAL PARAMETERS
-        hidden_dim, N, T, nhead, dim_feedforward = get_manual_parameters()
+        # Create Pure ViT model with optimized parameters
+        model = PureViTChess(
+            hidden_dim=params['hidden_dim'], 
+            n_heads=params['n_heads'], 
+            n_layers=params['n_layers'], 
+            ff_mult=params['ff_mult'],
+            dropout=params['dropout']
+        ).to(device)
         
-        # Apply GPU optimizations
-        batch_size = gpu_config['batch_size']
-        lr = 1e-4 * gpu_config['lr_multiplier']
-        
-        print(f"\nTraining config: batch_size={batch_size}, lr={lr:.6f}")
-        
-        # Create model
-        model = HRMChess(hidden_dim=hidden_dim, N=N, T=T, nhead=nhead, dim_feedforward=dim_feedforward).to(device)
+        # Multi-GPU support
         if torch.cuda.device_count() > 1:
             print(f"Using {torch.cuda.device_count()} GPUs (DataParallel)")
             model = torch.nn.DataParallel(model)
             
         # Model info
         total_params = sum(p.numel() for p in model.parameters())
-        hrm_steps = N * T
-        print(f"Model: {total_params:,} parameters, {hrm_steps} HRM steps (N={N} × T={T})")
+        print(f"\n🤖 Model: {total_params:,} parameters")
+        print(f"Architecture: Pure ViT (heads={params['n_heads']}, layers={params['n_layers']}, dim={params['hidden_dim']})")
         
         # Create dataset with compact game histories (scores embedded)
         compact_histories = game_history_data  # Each item now contains its own score
         history_length = info.get('history_length', 8)
-        dataset = ValueBinDataset(compact_histories, num_bins=128, history_length=history_length)
+        full_dataset = ValueBinDataset(compact_histories, num_bins=128, history_length=history_length)
         
-        epochs = 30
-        print(f"\nStarting training: {epochs} epochs, {len(dataset):,} positions")
+        print(f"\n📊 Dataset loaded: {len(full_dataset):,} positions available")
         
-        # Train
-        train_loop(model, dataset, epochs=epochs, batch_size=batch_size, lr=lr, warmup_epochs=3, device=device, use_amp=True)
+        # Determine training positions
+        if params['dataset_positions'] is None:
+            # Ask user how many positions to train on
+            while True:
+                try:
+                    user_input = input(f"How many positions do you want to train on? (1-{len(full_dataset):,}, or 'all'): ").strip().lower()
+                    
+                    if user_input == 'all':
+                        dataset = full_dataset
+                        training_positions = len(full_dataset)
+                        break
+                    else:
+                        training_positions = int(user_input.replace(',', ''))
+                        if 1 <= training_positions <= len(full_dataset):
+                            # Create subset of dataset
+                            if training_positions == len(full_dataset):
+                                dataset = full_dataset
+                            else:
+                                # Randomly sample positions
+                                indices = torch.randperm(len(full_dataset))[:training_positions]
+                                subset_data = [full_dataset.compact_game_history_list[i] for i in indices]
+                                dataset = ValueBinDataset(subset_data, num_bins=128, history_length=history_length)
+                            break
+                        else:
+                            print(f"❌ Please enter a number between 1 and {len(full_dataset):,}")
+                            
+                except ValueError:
+                    print("❌ Please enter a valid number or 'all'")
+        else:
+            # Use specified number of positions
+            training_positions = params['dataset_positions']
+            if training_positions >= len(full_dataset):
+                dataset = full_dataset
+                training_positions = len(full_dataset)
+            else:
+                indices = torch.randperm(len(full_dataset))[:training_positions]
+                subset_data = [full_dataset.compact_game_history_list[i] for i in indices]
+                dataset = ValueBinDataset(subset_data, num_bins=128, history_length=history_length)
         
-        # Save model
+        print(f"\n🚀 Starting training:")
+        print(f"   Epochs: {params['epochs']}")
+        print(f"   Positions: {len(dataset):,}")
+        print(f"   Batch size: {params['batch_size']}")
+        print(f"   Learning rate: {params['lr']:.2e}")
+        print(f"   Weight decay: {params['weight_decay']:.2e}")
+        print(f"📈 Training on {(len(dataset)/len(full_dataset)*100):.1f}% of available data")
+        
+        # Train with optimized parameters
+        train_loop(
+            model=model, 
+            dataset=dataset, 
+            epochs=params['epochs'], 
+            batch_size=params['batch_size'], 
+            lr=params['lr'], 
+            device=device, 
+            use_amp=True
+        )
+        
+        # Save model with optimized hyperparameters
         if isinstance(model, torch.nn.DataParallel):
             state_dict = model.module.state_dict()
         else:
@@ -787,33 +763,38 @@ if __name__ == "__main__":
         final_checkpoint = {
             'model_state_dict': state_dict,
             'hyperparams': {
-                'hidden_dim': hidden_dim,
-                'N': N,
-                'T': T,
-                'input_dim': 129,  # Updated for AlphaZero-style encoding with additional evaluation bitplanes
-                'nhead': nhead,
-                'dim_feedforward': dim_feedforward
+                'hidden_dim': params['hidden_dim'],
+                'n_heads': params['n_heads'],
+                'n_layers': params['n_layers'], 
+                'dim_feedforward': params['hidden_dim'] * params['ff_mult'],
+                'dropout': params['dropout'],
+                'model_type': 'pure_vit'
             },
             'training_info': {
-                'epochs': epochs,
-                'batch_size': batch_size,
-                'lr': lr,
-                'warmup_epochs': 3,
+                'epochs': params['epochs'],
+                'batch_size': params['batch_size'],
+                'lr': params['lr'],
+                'weight_decay': params['weight_decay'],
                 'dataset_size': len(dataset),
                 'total_params': total_params,
-                'training_mode': 'game_history_training',
-                'gpu_optimized': True,
-                'gpu_config': gpu_config,
-                'history_length': history_length
+                'training_mode': 'optimized_hyperparameters',
+                'history_length': history_length,
+                'optimized': True
             }
         }
         
-        model_path = "hrm_chess_model.pt"
+        model_path = f"optimized_vit_chess_model_{params['hidden_dim']}d_{params['n_layers']}l.pt"
         torch.save(final_checkpoint, model_path)
-        print(f"\nTraining completed! Model saved to: {model_path}")
-        print(f"HRM model (N={N}, T={T}, hidden_dim={hidden_dim}) with {total_params:,} parameters")
-        print(f"Trained on {len(dataset):,} positions")
+        print(f"\n✅ Training completed! Model saved to: {model_path}")
+        print(f"🏆 Optimized Pure ViT model:")
+        print(f"   Parameters: {total_params:,}")
+        print(f"   Architecture: {params['hidden_dim']}d-{params['n_heads']}h-{params['n_layers']}l-{params['ff_mult']}ff")
+        print(f"   Trained on: {len(dataset):,} positions")
+        print(f"   Hyperparameters: Optimized via hyperopt_search.py")
         
     except KeyboardInterrupt:
-        import sys
+        print("\n❌ Training interrupted by user")
         sys.exit(0)
+    except Exception as e:
+        print(f"\n❌ Training failed: {e}")
+        sys.exit(1)

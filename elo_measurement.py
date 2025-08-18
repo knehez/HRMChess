@@ -1,18 +1,21 @@
 """
 Convolutional HRM Chess Model ELO Rating
+
+Ez a script a Python stockfish modult használja a chess.engine helyett.
+Telepítés: pip install stockfish
 """
 
 import torch
 import chess
-import chess.engine
 import chess.pgn
 import numpy as np
 import time
-from hrm_model import HRMChess, load_model_with_amp, inference_with_amp
+from hrm_model import PureViTChess, load_model_with_amp, inference_with_amp
 from collections import defaultdict
 import json
 import os
 import glob
+from stockfish import Stockfish
 
 class ELORatingSystem:
     def __init__(self, model_path=None, use_half=False):
@@ -37,26 +40,32 @@ class ELORatingSystem:
                 use_half=self.use_half
             )
             
-            self.model_type = f"Transformer-HRM-{self.model_info['hidden_dim']}-N{self.model_info['N']}-T{self.model_info['T']}-nhead{self.model_info['nhead']}-dff{self.model_info['dim_feedforward']}"
+            # Build model type string (compatible with Vision Transformer models)
+            hidden_dim = self.model_info.get('hidden_dim', 256)
+            nhead = self.model_info.get('nhead', 8)
+            dim_feedforward = self.model_info.get('dim_feedforward', hidden_dim * 4)
+            
+            # Check if it's the new Vision Transformer model (no N/T parameters)
+            if 'N' in self.model_info and 'T' in self.model_info:
+                # Legacy HRM model
+                N = self.model_info['N']
+                T = self.model_info['T']
+                self.model_type = f"HRM-{hidden_dim}-N{N}-T{T}-nhead{nhead}-dff{dim_feedforward}"
+            else:
+                # New Vision Transformer model
+                self.model_type = f"ViT-ResNet-{hidden_dim}-nhead{nhead}-dff{dim_feedforward}"
+            
             if self.use_half:
                 self.model_type += "-FP16"
                 
-            print(f"✅ Transformer HRM model loaded successfully: {self.model_type}")
+            print(f"✅ Model loaded successfully: {self.model_type}")
             total_params = sum(p.numel() for p in self.model.parameters())
             print(f"📊 Model parameters: {total_params:,}")
-            print(f"🔧 Architecture: Transformer + HRM heads → value bin classification")
             
         except Exception as e:
             print(f"❌ Error loading model: {e}")
-            # Fallback to default model
-            print("� Creating default transformer HRM model...")
-            self.model = HRMChess(hidden_dim=128, N=4, T=4).to(self.device)
-            if self.use_half:
-                self.model.half()
-            self.model_type = "Default-Transformer-HRM-128"
-            if self.use_half:
-                self.model_type += "-FP16"
-                
+            exit(0) # no fallback
+
         self.model.eval()
         self.games_played = []
         # Always initialize move index attributes to avoid AttributeError
@@ -83,13 +92,12 @@ class ELORatingSystem:
             try:
                 # Load and check if it's a valid model file
                 checkpoint = torch.load(file, map_location='cpu', weights_only=False)
-                hidden_dim, N, T = self._detect_conv_parameters(checkpoint)
+                hidden_dim, model_type = self._detect_model_parameters(checkpoint)
                 file_size = os.path.getsize(file) / (1024 * 1024)
                 available_models.append({
                     'file': file,
                     'hidden_dim': hidden_dim,
-                    'N': N,
-                    'T': T,
+                    'model_type': model_type,
                     'size_mb': file_size
                 })
             except Exception as e:
@@ -101,12 +109,10 @@ class ELORatingSystem:
             print("🔧 Please train a model first using Chess.py")
             raise FileNotFoundError("No models available")
         
-        # Listázzuk az elérhető modelleket
-        print(f"\n📋 Available HRM models ({len(available_models)} found):")
+        print(f"\n📋 Available models ({len(available_models)} found):")
         print("-" * 80)
         for i, model in enumerate(available_models):
-            params = model['hidden_dim'] * (model['N'] + model['T']) / 1000  # Rough estimate
-            print(f"  {i+1}. {model['file']:<25} | Hidden: {model['hidden_dim']:<3} | N: {model['N']} T: {model['T']} | {model['size_mb']:.1f} MB")
+            print(f"  {i+1}. {model['file']:<25} | Hidden: {model['hidden_dim']:<3} | Type: {model['model_type']:<12} | {model['size_mb']:.1f} MB")
         print("-" * 80)
         
         # Felhasználói választás
@@ -121,62 +127,68 @@ class ELORatingSystem:
                 
                 if 0 <= choice_idx < len(available_models):
                     selected = available_models[choice_idx]
-                    print(f"✅ Selected: {selected['file']} (Hidden: {selected['hidden_dim']}, N: {selected['N']}, T: {selected['T']})")
+                    print(f"✅ Selected: {selected['file']} (Hidden: {selected['hidden_dim']}, Type: {selected['model_type']})")
                     return selected['file']
                 else:
                     print(f"❌ Invalid choice. Please enter 1-{len(available_models)}")
             except (ValueError, KeyboardInterrupt):
                 print(f"❌ Invalid input. Please enter 1-{len(available_models)}")
     
-    def _detect_conv_parameters(self, checkpoint):
-        """HRM modell paramétereinek detektálása"""
+    def _detect_model_parameters(self, checkpoint):
+        """Detect model parameters from checkpoint (supports HRM, ViT-ResNet and Pure ViT models)"""
         hidden_dim = None
-        N, T = 8, 8  # Default values
         
         # First check if hyperparams are saved in checkpoint
         if 'hyperparams' in checkpoint:
             hyperparams = checkpoint['hyperparams']
             hidden_dim = hyperparams.get('hidden_dim', None)
-            N = hyperparams.get('N', N)
-            T = hyperparams.get('T', T)
-            print(f"🔍 Found saved hyperparams: hidden_dim={hidden_dim}, N={N}, T={T}")
-            return hidden_dim, N, T
+            model_type = hyperparams.get('model_type', None)
+            
+            # Check model type from hyperparams
+            if model_type == 'pure_vit':
+                model_type = "Pure ViT"
+                print(f"🔍 Found Pure Vision Transformer model: hidden_dim={hidden_dim}")
+            elif 'N' in hyperparams and 'T' in hyperparams:
+                model_type = "HRM"
+                print(f"🔍 Found HRM model: hidden_dim={hidden_dim}")
+            else:
+                model_type = "ViT-ResNet"
+                print(f"🔍 Found Vision Transformer model: hidden_dim={hidden_dim}")
+            return hidden_dim, model_type
         
-        # Get the actual model state dict (handle both new and legacy formats)
+        # Get the actual model state dict
         if 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
         else:
             state_dict = checkpoint
         
-        # Fallback: detect from model layers
-        # Detect hidden_dim from convolutional layers
-        if 'board_conv.0.weight' in state_dict:
-            # First conv layer: 1 -> hidden_dim//4
-            first_conv_out = state_dict['board_conv.0.weight'].shape[0]
-            hidden_dim = first_conv_out * 4
-            print(f"🔍 Auto-detected hidden_dim: {hidden_dim} (from board_conv.0)")
-        elif 'board_conv.2.weight' in state_dict:
-            # Second conv layer: hidden_dim//4 -> hidden_dim//2
-            second_conv_out = state_dict['board_conv.2.weight'].shape[0]
-            hidden_dim = second_conv_out * 2
-            print(f"🔍 Auto-detected hidden_dim: {hidden_dim} (from board_conv.2)")
-        elif 'feature_combiner.0.weight' in state_dict:
-            # Feature combiner: combined_features -> hidden_dim
-            hidden_dim = state_dict['feature_combiner.0.weight'].shape[0]
-            print(f"🔍 Auto-detected hidden_dim: {hidden_dim} (from feature_combiner)")
-        elif 'L_net.0.weight' in state_dict:
-            # L_net input: hidden_dim * 3
-            l_net_input_size = state_dict['L_net.0.weight'].shape[1]
-            if l_net_input_size % 3 == 0:
-                hidden_dim = l_net_input_size // 3
-                print(f"🔍 Auto-detected hidden_dim: {hidden_dim} (from L_net)")
+        # Detect model type from layers
+        if 'patch_embedding.weight' in state_dict:
+            # Pure Vision Transformer model (has patch embedding)
+            model_type = "Pure ViT"
+            # Detect hidden_dim from patch embedding output dimension
+            hidden_dim = state_dict['patch_embedding.weight'].shape[0]
+            print(f"🔍 Auto-detected Pure Vision Transformer: hidden_dim={hidden_dim}")
+        elif 'value_head.pos' in state_dict:
+            # Vision Transformer model (has positional embeddings)
+            model_type = "ViT-ResNet"
+            # Detect hidden_dim from positional embedding
+            if 'value_head.pos' in state_dict:
+                hidden_dim = state_dict['value_head.pos'].shape[2]
+                print(f"🔍 Auto-detected Vision Transformer: hidden_dim={hidden_dim}")
+        else:
+            # Legacy HRM model
+            model_type = "HRM"
+            # Fallback detection methods for hidden_dim
+            if 'conv.0.weight' in state_dict:
+                hidden_dim = state_dict['conv.0.weight'].shape[0]
+                print(f"🔍 Auto-detected HRM model: hidden_dim={hidden_dim}")
         
         if hidden_dim is None:
-            print("⚠️ Could not detect hidden_dim, using default: 128")
-            hidden_dim = 128
-        
-        print(f"⚠️ N and T not saved in model, using defaults: N={N}, T={T}")
-        return hidden_dim, N, T
+            print("⚠️ Could not detect hidden_dim, using default: 256")
+            hidden_dim = 256
+            
+        return hidden_dim, model_type
     
     def model_move(self, board, temperature=1.0, debug=False, game_history=None):
         """
@@ -219,8 +231,8 @@ class ELORatingSystem:
             new_history = current_compact_history.copy()
             new_history['moves'] = current_compact_history['moves'] + [move.uci()]
             
-            # Convert the resulting position to bitplanes
-            bitplanes = game_to_bitplanes(new_history, history_length=8)
+            # Convert the resulting position to bitplanes (reduced history_length)
+            bitplanes = game_to_bitplanes(new_history)
             move_evaluations.append((move, bitplanes))
         
         # Batch evaluation of all resulting positions
@@ -259,93 +271,120 @@ class ELORatingSystem:
         return legal_moves[0], 0.5
     
     def play_vs_stockfish(self, stockfish_path, depth=1, time_limit=0.05, pgn=False, model_is_white=True):
-        """Továbbfejlesztett játék Stockfish ellen"""
+        """Továbbfejlesztett játék Stockfish ellen - Python stockfish modult használva"""
         print(f"\n🤖 Playing against Stockfish (depth={depth}, time={time_limit}s)")
         
         try:
-            with chess.engine.SimpleEngine.popen_uci(stockfish_path) as engine:
-                board = chess.Board()
-                moves_played = []
-                game_log = []
-                
-                # Track game history for the model
-                game_history = {
-                    'starting_fen': board.fen(),
-                    'moves': []
-                }
-                
-                while not board.is_game_over() and len(moves_played) < 150:  # Longer games
-                    if (board.turn == chess.WHITE) == model_is_white:
-                        # Model lépése - agresszívebb beállítás
-                        try:
-                            move, confidence = self.model_move(board, temperature=0.3, debug=False, game_history=game_history)
-                            board.push(move)
-                            game_history['moves'].append(move.uci())  # Track move in history
-                            moves_played.append(f"Model: {move}")
-                            game_log.append(f"Move {len(moves_played)}: Model plays {move} (conf: {confidence:.3f})")
-                        except Exception as e:
-                            print(f"Model error: {e}")
-                            break
-                    else:
-                        # Stockfish lépése
-                        try:
-                            result = engine.play(board, chess.engine.Limit(depth=depth, time=time_limit))
-                            board.push(result.move)
-                            game_history['moves'].append(result.move.uci())  # Track move in history
-                            moves_played.append(f"SF: {result.move}")
-                            game_log.append(f"Move {len(moves_played)}: Stockfish plays {result.move}")
-                        except Exception as e:
-                            print(f"Stockfish error: {e}")
-                            break
-                
-                # Játék eredménye
-                result = board.result()
-                winner = None
-                termination_reason = "Normal"
-                
-                if board.is_checkmate():
-                    termination_reason = "Checkmate"
-                elif board.is_stalemate():
-                    termination_reason = "Stalemate"
-                elif board.is_insufficient_material():
-                    termination_reason = "Insufficient material"
-                elif len(moves_played) >= 150:
-                    termination_reason = "Move limit"
-                
-                if result == "1-0":
-                    winner = "Model" if model_is_white else "Stockfish"
-                elif result == "0-1":
-                    winner = "Stockfish" if model_is_white else "Model"
+            # Initialize Stockfish with Python module
+            stockfish = Stockfish(path=stockfish_path)
+            
+            # Set Stockfish parameters
+            stockfish.set_depth(depth)
+            stockfish_settings = {
+                "Threads": 1,
+                "Hash": 16,
+                "UCI_Chess960": "false",
+                "UCI_LimitStrength": "false"
+            }
+            stockfish.update_engine_parameters(stockfish_settings)
+            
+            board = chess.Board()
+            moves_played = []
+            game_log = []
+            
+            # Track game history for the model
+            game_history = {
+                'starting_fen': board.fen(),
+                'moves': []
+            }
+            
+            print(f"🎮 Starting game: Model is {'White' if model_is_white else 'Black'}")
+            
+            while not board.is_game_over() and len(moves_played) < 150:  # Longer games
+                if (board.turn == chess.WHITE) == model_is_white:
+                    # Model lépése - agresszívebb beállítás
+                    try:
+                        move, confidence = self.model_move(board, temperature=0.3, debug=False, game_history=game_history)
+                        board.push(move)
+                        game_history['moves'].append(move.uci())  # Track move in history
+                        moves_played.append(f"Model: {move}")
+                        game_log.append(f"Move {len(moves_played)}: Model plays {move} (conf: {confidence:.3f})")
+                    except Exception as e:
+                        print(f"❌ Model error: {e}")
+                        break
                 else:
-                    winner = "Draw"
-                
-                game_data = {
-                    "opponent": f"Stockfish_D{depth}_T{time_limit}",
-                    "result": result,
-                    "winner": winner,
-                    "moves": len(moves_played),
-                    "termination": termination_reason,
-                    "model_color": "White" if model_is_white else "Black",
-                    "game_log": game_log[-10:]  # Last 10 moves for analysis
-                }
-                
-                print(f"Game ended: {result} - Winner: {winner} ({len(moves_played)} moves)")
-                print(f"Termination: {termination_reason}")
-                
-                # Show some key moves
-                if len(game_log) > 5:
-                    print(f"Sample moves: {game_log[0]}, ..., {game_log[-1]}")
-                # PGN output if requested
-                if pgn:
-                    game_pgn = chess.pgn.Game.from_board(board)
-                    game_pgn.headers["White"] = "Model" if model_is_white else "Stockfish"
-                    game_pgn.headers["Black"] = "Stockfish" if model_is_white else "Model"
-                    print("\nPGN:\n", game_pgn)
-                
-                return game_data
+                    # Stockfish lépése
+                    try:
+                        # Update Stockfish with current position before getting move
+                        stockfish.set_position(game_history['moves'])
+                        
+                        # Get best move from Stockfish
+                        stockfish_move = stockfish.get_best_move()
+                        if stockfish_move is None:
+                            print("❌ Stockfish couldn't find a move")
+                            break
+                            
+                        move = chess.Move.from_uci(stockfish_move)
+                        if move not in board.legal_moves:
+                            print(f"❌ Stockfish suggested illegal move: {stockfish_move}")
+                            break
+                            
+                        board.push(move)
+                        game_history['moves'].append(move.uci())  # Track move in history
+                        moves_played.append(f"SF: {move}")
+                        game_log.append(f"Move {len(moves_played)}: Stockfish plays {move}")
+                    except Exception as e:
+                        print(f"❌ Stockfish error: {e}")
+                        break
+            
+            # Game ended - evaluate result
+            result = board.result()
+            winner = None
+            termination_reason = "Normal"
+            
+            if board.is_checkmate():
+                termination_reason = "Checkmate"
+            elif board.is_stalemate():
+                termination_reason = "Stalemate"
+            elif board.is_insufficient_material():
+                termination_reason = "Insufficient material"
+            elif len(moves_played) >= 150:
+                termination_reason = "Move limit"
+            
+            if result == "1-0":
+                winner = "Model" if model_is_white else "Stockfish"
+            elif result == "0-1":
+                winner = "Stockfish" if model_is_white else "Model"
+            else:
+                winner = "Draw"
+            
+            game_data = {
+                "opponent": f"Stockfish_D{depth}_T{time_limit}",
+                "result": result,
+                "winner": winner,
+                "moves": len(moves_played),
+                "termination": termination_reason,
+                "model_color": "White" if model_is_white else "Black",
+                "game_log": game_log[-10:]  # Last 10 moves for analysis
+            }
+            
+            print(f"Game ended: {result} - Winner: {winner} ({len(moves_played)} moves)")
+            print(f"Termination: {termination_reason}")
+            
+            # Show some key moves
+            if len(game_log) > 5:
+                print(f"Sample moves: {game_log[0]}, ..., {game_log[-1]}")
+            # PGN output if requested
+            if pgn:
+                game_pgn = chess.pgn.Game.from_board(board)
+                game_pgn.headers["White"] = "Model" if model_is_white else "Stockfish"
+                game_pgn.headers["Black"] = "Stockfish" if model_is_white else "Model"
+                print("\nPGN:\n", game_pgn)
+            
+            return game_data
                 
         except FileNotFoundError:
-            print("❌ Stockfish nem található! Töltsd le: https://stockfishchess.org/download/")
+            print("❌ Stockfish nem található! Telepítsd a stockfish Python modult: pip install stockfish")
             return None
         except Exception as e:
             print(f"❌ Hiba: {e}")
@@ -674,18 +713,28 @@ def main():
                 "/usr/games/stockfish"
             ]
         
+        # Test if we can initialize Stockfish with the path
         for path in candidates:
             if os.path.exists(path):
-                print(f"✅ Found Stockfish at: {path}")
-                return path
+                try:
+                    # Test with Python stockfish module
+                    test_stockfish = Stockfish(path=path)
+                    # Try to get a simple move to validate the engine
+                    test_stockfish.set_position(["e2e4"])
+                    if test_stockfish.get_best_move() is not None:
+                        print(f"✅ Found Stockfish at: {path}")
+                        return path
+                except Exception:
+                    continue
         
         return None
     
     stockfish_path = find_stockfish_path()
     
     if not stockfish_path:
-        print("⚠️ Stockfish not found. Download from: https://stockfishchess.org/download/")
-        print("📍 For more accurate rating, install Stockfish")
+        print("⚠️ Stockfish not found or stockfish Python module not installed.")
+        print("📍 Install with: pip install stockfish")
+        print("📍 Download Stockfish binary from: https://stockfishchess.org/download/")
         print()
     
     # Teljes ELO mérés
