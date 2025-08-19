@@ -521,6 +521,7 @@ class ELORatingSystem:
         
         solved = 0
         total_rating = 0
+        total_confidence = 0.0
         detailed_results = []
         
         for i, puzzle in enumerate(puzzles):
@@ -537,6 +538,7 @@ class ELORatingSystem:
             if correct:
                 solved += 1
                 total_rating += puzzle["rating"]
+                total_confidence += confidence
                 status = "✅ SOLVED"
             else:
                 status = "❌ FAILED"
@@ -558,7 +560,8 @@ class ELORatingSystem:
         
         if solved > 0:
             avg_puzzle_rating = total_rating // solved
-            print(f"Average solved puzzle rating: {avg_puzzle_rating} ELO")
+            avg_puzzle_confidence = total_confidence / solved
+            print(f"Average solved puzzle rating: {avg_puzzle_rating} ELO | Average solved puzzle confidence: {avg_puzzle_confidence:.3f}")
             # Bonus for multiple solutions
             bonus = min(50 * solved, 200)  # Max 200 ELO bonus
             final_puzzle_rating = avg_puzzle_rating + bonus

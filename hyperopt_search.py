@@ -62,25 +62,25 @@ class ProgressiveHyperOptimizer:
         self.clear_gpu_memory()
         
         # Hyperparameters to optimize with validation
-        hidden_dim = trial.suggest_categorical('hidden_dim', [128, 192, 256, 384, 512])
-        n_layers = trial.suggest_int('n_layers', 3, 8)
-        n_heads = trial.suggest_categorical('n_heads', [4, 6, 8, 12, 16])
+        hidden_dim = trial.suggest_categorical('hidden_dim', [192, 256, 384])  # Nagyobb modellek is
+        n_layers = trial.suggest_int('n_layers', 6, 10)  # Mélyebb modellek
+        n_heads = trial.suggest_categorical('n_heads', [6, 8, 12, 16, 24])  # Több head
         
         # Validate hidden_dim % n_heads == 0
         if hidden_dim % n_heads != 0:
             raise ValueError(f"embed_dim ({hidden_dim}) must be divisible by num_heads ({n_heads})")
         
-        ff_mult = trial.suggest_categorical('ff_mult', [2, 3, 4, 6])
-        dropout = trial.suggest_float('dropout', 0.0, 0.3)
+        ff_mult = trial.suggest_categorical('ff_mult', [4, 6])
+        dropout = trial.suggest_float('dropout', 0.1, 0.25)  # Kisebb dropout range nagy adatnál
         
         # Training hyperparameters
-        lr = trial.suggest_float('lr', 1e-5, 1e-3, log=True)
-        batch_size = trial.suggest_categorical('batch_size', [16, 24, 32, 48, 64])
-        weight_decay = trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
+        lr = trial.suggest_float('lr', 5e-6, 1e-4, log=True)  # Kisebb LR range nagy adatnál
+        batch_size = trial.suggest_categorical('batch_size', [128])  # Nagyobb batch sizes
+        weight_decay = trial.suggest_float('weight_decay', 1e-7, 5e-4, log=True)  # Kisebb weight decay
         
-        # Memory check: skip very large models to avoid OOM (float16 uses less memory)
+        # Memory check: skip very large models to avoid OOM (adjusted for larger datasets)
         model_memory_est = hidden_dim * n_layers * ff_mult * batch_size
-        if model_memory_est > 2500000:  # Higher threshold since we're using float16
+        if model_memory_est > 5000000:  # Nagyobb threshold nagyobb adatokhoz
             raise ValueError(f"Model too large (estimated memory: {model_memory_est})")
         
         # Create model with mixed precision (not explicit float16)
@@ -273,10 +273,11 @@ class ProgressiveHyperOptimizer:
             
             # Early termination if loss is too high on smaller datasets
             if stage_losses:  # Only check if we have results
-                early_termination_thresholds = {0: 4.5, 1: 3.8, 2: 3.2}
+                # Lazább thresholdok nagyobb dataset optimalizáláshoz
+                early_termination_thresholds = {0: 4.8, 1: 4.0, 2: 3.5, 3: 3.0}
                 current_loss = stage_losses[-1]
                 if stage in early_termination_thresholds and current_loss > early_termination_thresholds[stage]:
-                    stage_name = ["very early", "early", "mid"][stage] if stage < 3 else "late"
+                    stage_name = ["very early", "early", "mid", "late"][stage] if stage < 4 else "final"
                     print(f"  ⚠️ {stage_name.title()} stage high loss ({current_loss:.3f}) on stage {stage+1}, terminating trial")
                     break
         
@@ -364,14 +365,14 @@ def main():
     # Configuration
     optimizer = ProgressiveHyperOptimizer(
         dataset_path='game_history_dataset.pt',
-        min_samples=2048,      # Start small for quick feedback
-        max_samples=1000000,   # Target size
-        stages=4,              # Progressive stages
-        max_epochs_per_stage=8 # Reasonable for exploration
+        min_samples=8192,      # Start small for quick feedback
+        max_samples=10000000,  # Target size - full dataset
+        stages=5,              # More progressive stages for better scaling
+        max_epochs_per_stage=6 # Reduced epochs for larger datasets
     )
     
     # Run optimization
-    _, best_params = optimizer.optimize(n_trials=30)
+    _, best_params = optimizer.optimize(n_trials=20)
     
     print("\n🎯 Recommended hyperparameters for large dataset:")
     print(f"   Hidden Dim: {best_params['hidden_dim']}")

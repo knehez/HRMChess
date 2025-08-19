@@ -323,9 +323,9 @@ class PureViTChess(nn.Module):
         cls = self.cls_token.expand(B, 1, self.hidden_dim)
         x = torch.cat([cls, x], dim=1)                            # [B,129,C]
 
-        # Transformer
+        # Transformer (már tartalmazza a n_layers darab réteget)
         x = self.transformer(x)                                   # [B,129,C]
-
+        
         # [CLS] -> logits
         cls_out = self.norm(x[:, 0])
         logits = self.head(cls_out)                               # [B,num_bins]

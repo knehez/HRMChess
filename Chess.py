@@ -42,7 +42,7 @@ def get_hyperparameters():
     parser.add_argument('--lr', type=float, help='Learning rate (1e-5 to 1e-3)')
     parser.add_argument('--batch_size', type=int, help='Batch size (16-128)')
     parser.add_argument('--weight_decay', type=float, help='Weight decay (1e-6 to 1e-3)')
-    parser.add_argument('--epochs', type=int, default=10, help='Number of epochs')
+    parser.add_argument('--epochs', type=int, default=30, help='Number of epochs')
     parser.add_argument('--dataset_positions', type=int, help='Number of training positions (or "all")')
     
     args = parser.parse_args()
@@ -52,50 +52,51 @@ def get_hyperparameters():
                args.dropout, args.lr, args.batch_size, args.weight_decay]):
         print("\n🎯 OPTIMIZED HYPERPARAMETER CONFIGURATION")
         print("=" * 50)
-        print("Enter the optimized hyperparameters from hyperopt_search.py:")
+        print("Enter the optimized hyperparameters (press Enter for defaults):")
         
         params = {}
         
         # Get parameters from user input if not provided via command line
         params['hidden_dim'] = args.hidden_dim or get_parameter_input(
             "Hidden dimension", int, 64, 1024, 
-            "Controls model capacity (64-1024)"
+            "Controls model capacity", 128  # default value
         )
         
         params['n_heads'] = args.n_heads or get_parameter_input(
             "Number of attention heads", int, 4, 16,
             f"Must divide hidden_dim ({params['hidden_dim']})", 
-            lambda x: params['hidden_dim'] % x == 0
+            8,  # default value
+            lambda x: params['hidden_dim'] % x == 0  # validator
         )
         
         params['n_layers'] = args.n_layers or get_parameter_input(
-            "Number of transformer layers", int, 3, 8,
-            "Controls model depth"
+            "Number of transformer layers", int, 3, 16,
+            "Controls model depth", 8  # default value
         )
         
         params['ff_mult'] = args.ff_mult or get_parameter_input(
             "Feedforward multiplier", int, 2, 6,
-            "Feedforward dim = hidden_dim * ff_mult"
+            "Feedforward dim = hidden_dim * ff_mult", 4  # default value
         )
         
         params['dropout'] = args.dropout or get_parameter_input(
             "Dropout rate", float, 0.0, 0.3,
-            "Regularization strength"
+            "Regularization strength", 0.1  # default value
         )
         
         params['lr'] = args.lr or get_parameter_input(
-            "Learning rate", float, 1e-5, 1e-3,
-            "Optimizer learning rate (scientific notation: 3.5e-4)"
+            "Learning rate", float, 1e-5, 1e-2,
+            "Optimizer learning rate", 1e-3  # default value
         )
         
         params['batch_size'] = args.batch_size or get_parameter_input(
-            "Batch size", int, 16, 128,
-            "Training batch size"
+            "Batch size", int, 16, 512,
+            "Training batch size", 128  # default value
         )
         
         params['weight_decay'] = args.weight_decay or get_parameter_input(
             "Weight decay", float, 1e-6, 1e-3,
-            "L2 regularization (scientific notation: 3.7e-5)"
+            "L2 regularization", 1e-5  # default value
         )
         
         params['epochs'] = args.epochs
@@ -118,16 +119,26 @@ def get_hyperparameters():
         }
 
 
-def get_parameter_input(name, param_type, min_val, max_val, description, validator=None):
-    """Helper function to get a single parameter from user input with validation"""
+def get_parameter_input(name, param_type, min_val, max_val, description, default_value=None, validator=None):
+    """Helper function to get a single parameter from user input with validation and default support"""
     while True:
         try:
-            user_input = input(f"\n{name} ({min_val}-{max_val}): ")
-            if param_type == float:
-                # Handle scientific notation
-                value = float(user_input)
+            prompt = f"\n{name} ({min_val}-{max_val})"
+            if default_value is not None:
+                prompt += f" [default: {default_value}]"
+            prompt += ": "
+            
+            user_input = input(prompt).strip()
+            
+            # Use default if input is empty
+            if not user_input and default_value is not None:
+                value = default_value
             else:
-                value = param_type(user_input)
+                if param_type == float:
+                    # Handle scientific notation
+                    value = float(user_input)
+                else:
+                    value = param_type(user_input)
             
             if not (min_val <= value <= max_val):
                 print(f"❌ Value must be between {min_val} and {max_val}")
@@ -554,19 +565,54 @@ def generate_stockfish_dataset_parallel(num_games=1000, num_workers=4, movetime=
 # Import StockfishEvaluator and ParallelStockfishEvaluator from the new module
 from stockfish_eval import StockfishEvaluator, ParallelStockfishEvaluator
 
+def clear_gpu_memory():
+    """Clear GPU memory and wait for cleanup"""
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            torch.cuda.ipc_collect()  # Additional cleanup
+            torch.cuda.empty_cache()  # Second pass
+            time.sleep(2)  # Wait for cleanup
+            print("🧹 GPU memory cleared")
+        except Exception as e:
+            print(f"⚠️ GPU memory cleanup warning: {e}")
+            time.sleep(3)
+
+def retry_with_memory_management(func, max_retries=3, *args, **kwargs):
+    """Retry function with memory management between attempts"""
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e) and attempt < max_retries - 1:
+                print(f"\n💾 CUDA OOM Error (attempt {attempt + 1}/{max_retries})")
+                print(f"Error: {e}")
+                print("🧹 Clearing GPU memory and retrying...")
+                
+                # Progressive cleanup
+                clear_gpu_memory()
+                
+                # Wait progressively longer
+                wait_time = (attempt + 1) * 5
+                print(f"⏳ Waiting {wait_time} seconds for GPU cleanup...")
+                time.sleep(wait_time)
+                
+                # Set expandable segments for better memory management
+                import os
+                os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:256'
+                
+                continue
+            else:
+                raise
+    
+    raise RuntimeError(f"Failed after {max_retries} attempts with memory management")
+
 if __name__ == "__main__":
     try:
         print("🏆 PURE VISION TRANSFORMER CHESS MODEL TRAINING")
         print("=" * 60)
         print(f"Using device: {device}")
-        
-        # Get optimized hyperparameters
-        params = get_hyperparameters()
-        
-        # Show configuration and get user confirmation
-        if not print_configuration(params):
-            print("Training cancelled by user.")
-            sys.exit(0)
         
         # Load or create dataset
         dataset_path = "game_history_dataset.pt"
@@ -662,13 +708,26 @@ if __name__ == "__main__":
         else:
             print("   Warning: No 'data' key found in loaded dataset for deduplication.")
             dataset_info = data.get('dataset_info', {})
-            
+        
+        # Get optimized hyperparameters
+        params = get_hyperparameters()
+        
+        # Show configuration and get user confirmation
+        if not print_configuration(params):
+            print("Training cancelled by user.")
+            sys.exit(0)
+        
         # Extract data
         game_history_data = dataset_info['data']
         info = dataset_info['info']
         print(f"Dataset loaded: {len(game_history_data):,} positions")
         print(f"Source: {info.get('source', 'Unknown')}")
         print(f"History length: {info.get('history_length', 'Unknown')} ply")
+        
+        # Clear GPU memory before model creation
+        if torch.cuda.is_available():
+            clear_gpu_memory()
+            print("🧹 Cleared GPU memory before model creation")
         
         # Create Pure ViT model with optimized parameters
         model = PureViTChess(
@@ -743,8 +802,25 @@ if __name__ == "__main__":
         print(f"   Weight decay: {params['weight_decay']:.2e}")
         print(f"📈 Training on {(len(dataset)/len(full_dataset)*100):.1f}% of available data")
         
-        # Train with optimized parameters
-        train_loop(
+        # Setup GPU memory management
+        if torch.cuda.is_available():
+            print(f"🔍 GPU Memory before training:")
+            print(f"   Allocated: {torch.cuda.memory_allocated()/1024/1024/1024:.2f} GB")
+            print(f"   Reserved: {torch.cuda.memory_reserved()/1024/1024/1024:.2f} GB")
+            
+            # Clear any existing memory
+            clear_gpu_memory()
+            
+            # Set memory management environment variables
+            import os
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:256'
+            print("🔧 Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256")
+        
+        # Train with retry mechanism for CUDA OOM errors
+        print("\n🚀 Starting training with memory management and retry mechanism...")
+        retry_with_memory_management(
+            train_loop,
+            max_retries=3,
             model=model, 
             dataset=dataset, 
             epochs=params['epochs'], 
@@ -794,7 +870,27 @@ if __name__ == "__main__":
         
     except KeyboardInterrupt:
         print("\n❌ Training interrupted by user")
+        if torch.cuda.is_available():
+            clear_gpu_memory()
         sys.exit(0)
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            print(f"\n💾 CUDA Memory Error: {e}")
+            print("🔍 GPU Memory debugging info:")
+            if torch.cuda.is_available():
+                print(f"   Allocated: {torch.cuda.memory_allocated()/1024/1024/1024:.2f} GB")
+                print(f"   Reserved: {torch.cuda.memory_reserved()/1024/1024/1024:.2f} GB")
+                print("💡 Suggestions:")
+                print("   - Try reducing batch_size (e.g., 32 → 16 or 8)")
+                print("   - Try reducing hidden_dim (e.g., 256 → 128)")
+                print("   - Try reducing n_layers (e.g., 6 → 4)")
+                print("   - Close other GPU processes")
+                clear_gpu_memory()
+        else:
+            print(f"\n❌ Runtime error: {e}")
+        sys.exit(1)
     except Exception as e:
         print(f"\n❌ Training failed: {e}")
+        if torch.cuda.is_available():
+            clear_gpu_memory()
         sys.exit(1)
